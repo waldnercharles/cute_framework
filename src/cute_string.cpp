@@ -252,7 +252,7 @@ char* cf_ssplit_once(char* s, char split_c)
 {
 	CF_ACANARY(s);
 	char* start = s;
-	char* end = s + slen(s) - 1;
+	char* end = s + slen(s);
 	while (start < end) {
 		if (*start == split_c) {
 			break;
@@ -260,7 +260,7 @@ char* cf_ssplit_once(char* s, char split_c)
 		++start;
 	}
 	int len = (int)(start - s);
-	if (len + 1 == slen(s)) return NULL;
+	if (len == slen(s)) return NULL;
 	char* split = NULL;
 	sfit(split, len + 1);
 	alen(split) = len + 1;
