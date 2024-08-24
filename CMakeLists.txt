@@ -276,7 +276,7 @@ if (WINDOWS)
 	add_custom_command(TARGET cute POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different
 		${DXC_DLLS}
-		${CMAKE_BINARY_DIR}
+		${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
 	)
 endif()
 
