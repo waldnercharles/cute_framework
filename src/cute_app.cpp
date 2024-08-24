@@ -280,7 +280,8 @@ CF_Result cf_make_app(const char* window_title, int display_index, int x, int y,
 
 	if (use_gfx) {
 		app->device = device;
-		SDL_GpuClaimWindow(app->device, app->window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_IMMEDIATE);
+		SDL_GpuClaimWindow(app->device, app->window);
+		SDL_GpuSetSwapchainParameters(app->device, app->window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_IMMEDIATE);
 		app->cmd = SDL_GpuAcquireCommandBuffer(app->device);
 		cf_load_internal_shaders();
 		cf_make_draw();
@@ -511,19 +512,19 @@ int cf_app_draw_onto_screen(bool clear)
 	SDL_GpuTexture* swapchain_tex = SDL_GpuAcquireSwapchainTexture(app->cmd, app->window, &w, &h);
 	if (swapchain_tex) {
 		// Blit onto the screen.
-		SDL_GpuTextureRegion src = {
+		SDL_GpuBlitRegion src = {
 			.texture = (SDL_GpuTexture*)cf_texture_handle(cf_canvas_get_target(app->offscreen_canvas)),
+			.layerOrDepthPlane = 1,
 			.w = w,
-			.h = h,
-			.d = 1,
+			.h = h
 		};
-		SDL_GpuTextureRegion dst = {
+		SDL_GpuBlitRegion dst = {
 			.texture = swapchain_tex,
+			.layerOrDepthPlane = 1,
 			.w = w,
-			.h = h,
-			.d = 1
+			.h = h
 		};
-		SDL_GpuBlit(app->cmd, &src, &dst, SDL_GPU_FILTER_NEAREST, SDL_FALSE);
+		SDL_GpuBlit(app->cmd, &src, &dst, SDL_FLIP_NONE, SDL_GPU_FILTER_NEAREST, SDL_FALSE);
 	}
 
 	// Dear ImGui draw.

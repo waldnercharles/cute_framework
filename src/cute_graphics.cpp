@@ -620,8 +620,7 @@ void cf_texture_update(CF_Texture texture_handle, void* data, int size)
 		};
 		buf = SDL_GpuCreateTransferBuffer(app->device, &tbuf_info);
 	}
-	uint8_t* p;
-	SDL_GpuMapTransferBuffer(app->device, buf, tex->buf ? true : false, (void**)&p);
+	uint8_t* p = (uint8_t*)SDL_GpuMapTransferBuffer(app->device, buf, tex->buf != NULL);
 	CF_MEMCPY(p, data, size);
 	SDL_GpuUnmapTransferBuffer(app->device, buf);
 
@@ -634,7 +633,7 @@ void cf_texture_update(CF_Texture texture_handle, void* data, int size)
 	src.imagePitch = tex->w;
 	src.imageHeight = tex->h;
 	SDL_GpuTextureRegion dst = SDL_GpuTextureRegionDefaults(tex, tex->w, tex->h);
-	SDL_GpuUploadToTexture(pass, &src, &dst, tex->buf ? true : false);
+	SDL_GpuUploadToTexture(pass, &src, &dst, tex->buf != NULL);
 	SDL_GpuEndCopyPass(pass);
 	if (!tex->buf) SDL_GpuReleaseTransferBuffer(app->device, buf);
 	if (!app->cmd) SDL_GpuSubmit(cmd);
@@ -1339,8 +1338,7 @@ void cf_mesh_update_vertex_data(CF_Mesh mesh_handle, void* data, int count)
 	}
 
 	CF_ASSERT(size <= mesh->vertices.size);
-	void* p = NULL;
-	SDL_GpuMapTransferBuffer(app->device, mesh->vertices.transfer_buffer, true, &p);
+	void* p = SDL_GpuMapTransferBuffer(app->device, mesh->vertices.transfer_buffer, true);
 	CF_MEMCPY(p, data, size);
 	SDL_GpuUnmapTransferBuffer(app->device, mesh->vertices.transfer_buffer);
 	mesh->vertices.element_count = count;
@@ -1689,7 +1687,7 @@ static SDL_GpuGraphicsPipeline* s_build_pipeline(CF_ShaderInternal* shader, CF_R
 	vertex_bindings[0].binding = 0;
 	vertex_bindings[0].stride = mesh->vertices.stride;
 	vertex_bindings[0].inputRate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
-	vertex_bindings[0].stepRate = 0;
+	vertex_bindings[0].instanceStepRate = 0;
 	pip_info.vertexInputState.vertexBindings = vertex_bindings;
 	//if (has_instance_data) {
 	//	vertex_bindings[1].binding = 1;
@@ -1833,7 +1831,7 @@ void cf_draw_elements()
 		//SDL_GpuDrawIndexedPrimitives(s_canvas->pass, 0, mesh->vertices.element_count);
 		CF_ASSERT(false);
 	} else {
-		SDL_GpuDrawPrimitives(s_canvas->pass, 0, mesh->vertices.element_count);
+		SDL_GpuDrawPrimitives(s_canvas->pass, 0, mesh->vertices.element_count, 1, 0);
 	}
 	app->draw_call_count++;
 }
