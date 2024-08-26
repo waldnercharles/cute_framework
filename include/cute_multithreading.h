@@ -512,6 +512,18 @@ CF_API void CF_CALL cf_write_unlock(CF_ReadWriteLock* rw);
 typedef void (CF_CALL CF_TaskFn)(void* param);
 
 /**
+ * @function CF_TaskBlockFn
+ * @category multithreading
+ * @brief    A function pointer for a task in `CF_Threadpool`.
+ * @param    param      Can be `NULL`. This is passed to the task, and comes from `cf_threadpool_add_task`.
+ * @remarks  Threadpools are an advanced topic. You've been warned! John has a [good article on threadpools](https://nachtimwald.com/2019/04/12/thread-pool-in-c/).
+ *           A task is a single function that a thread in the threadpool will run. Usually they perform one chunk of work, and then
+ *           return. Often a task is defined as a bunch of processing that doesn't share any data external to the task.
+ * @related  CF_TaskFn CF_TaskBlockFn cf_make_threadpool cf_destroy_threadpool cf_threadpool_add_task cf_threadpool_kick_and_wait cf_threadpool_kick
+ */
+typedef void(CF_CALL CF_TaskBlockFn)(void *elements, int i, void *param);
+
+/**
  * @function cf_make_threadpool
  * @category multithreading
  * @brief    Returns an opaque `CF_Threadpool` pointer.
@@ -545,6 +557,19 @@ CF_API void CF_CALL cf_destroy_threadpool(CF_Threadpool* pool);
  * @related  CF_TaskFn cf_make_threadpool cf_destroy_threadpool cf_threadpool_add_task cf_threadpool_kick_and_wait cf_threadpool_kick
  */
 CF_API void CF_CALL cf_threadpool_add_task(CF_Threadpool* pool, CF_TaskFn* task, void* param);
+
+/**
+ * @function cf_threadpool_add_task_block
+ * @category multithreading
+ * @brief    Adds multiple `CF_TaskBlockFn` to the threadpool.
+ * @param    pool       The pool.
+ * @param    task       The task for a thread in the pool to perform.
+ * @param    param      Can be `NULL`. This gets handed to the `CF_TaskBlockFn` when it gets called.
+ * @remarks  Once a task is added to the pool `cf_threadpool_kick_and_wait` or `cf_threadpool_kick` must be called wake threads. Once
+ *           awake, threads will process the tasks. The order of start/finish for the tasks is not deterministic.
+ * @related  CF_TaskBlockFn cf_make_threadpool cf_destroy_threadpool cf_threadpool_add_task cf_threadpool_kick_and_wait cf_threadpool_kick
+ */
+CF_API void CF_CALL cf_threadpool_add_task_block(CF_Threadpool *tp, CF_TaskBlockFn *fn, void *elements, int elements_count, void *udata);
 
 /**
  * @function cf_threadpool_kick_and_wait

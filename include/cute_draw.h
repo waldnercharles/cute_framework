@@ -30,6 +30,9 @@ extern "C" {
  */
 CF_API void CF_CALL cf_draw_sprite(const CF_Sprite* sprite);
 
+CF_API void CF_CALL cf_draw_sprites(CF_Threadpool* tp, const CF_Sprite* sprites, int sprites_count);
+
+
 /**
  * @function cf_draw_quad
  * @category draw

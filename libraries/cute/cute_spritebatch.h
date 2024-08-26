@@ -1160,9 +1160,9 @@ void spritebatch_set_default_config(spritebatch_config_t* config)
 
 #define SPRITEBATCH_CHECK_BUFFER_GROW(ctx, count, capacity, data, type) \
 	do { \
-		if (ctx->count == ctx->capacity) \
+		if (ctx->count >= ctx->capacity) \
 		{ \
-			int new_capacity = ctx->capacity * 2; \
+			int new_capacity = ctx->count * 2; \
 			void* new_data = SPRITEBATCH_MALLOC(sizeof(type) * new_capacity, ctx->mem_ctx); \
 			if (!new_data) return 0; \
 			SPRITEBATCH_MEMCPY(new_data, ctx->data, sizeof(type) * ctx->count); \
@@ -1171,7 +1171,6 @@ void spritebatch_set_default_config(spritebatch_config_t* config)
 			ctx->capacity = new_capacity; \
 		} \
 	} while (0)
-
 
 int spritebatch_internal_fill_internal_sprite(spritebatch_t* sb, spritebatch_sprite_t sprite, spritebatch_internal_sprite_t* out)
 {
@@ -1199,6 +1198,18 @@ int spritebatch_internal_fill_internal_sprite(spritebatch_t* sb, spritebatch_spr
 #endif
 
 	return 1;
+}
+
+void spritebatch_set(spritebatch_t *sb, spritebatch_sprite_t sprite, int index)
+{
+	if (sb->input_count <= index) {
+		sb->input_count = index + 1;
+	}
+
+	spritebatch_internal_sprite_t sprite_out;
+	spritebatch_internal_fill_internal_sprite(sb, sprite, &sprite_out);
+
+	sb->input_buffer[index] = sprite_out;
 }
 
 void spritebatch_internal_append_sprite(spritebatch_t* sb, spritebatch_internal_sprite_t sprite)

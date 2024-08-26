@@ -510,6 +510,88 @@ void cf_destroy_draw()
 }
 
 //--------------------------------------------------------------------------------------------------
+void cf_draw_sprites(CF_Threadpool* tp, const CF_Sprite* sprites, int sprites_count)
+{
+	spritebatch_t *sb = &draw->sb;
+
+	// We're about to append a bunch of sprites, ensure we have enough room.
+	sb->input_count += sprites_count;
+	if (sb->input_count >= sb->input_capacity) {
+		int new_capacity = sb->input_count * 2;
+		void *new_data = malloc(sizeof(spritebatch_internal_sprite_t) * new_capacity);
+		if (!new_data) return;
+		memcpy(new_data, sb->input_buffer, sizeof(spritebatch_internal_sprite_t) * sb->input_count);
+		free(sb->input_buffer);
+		sb->input_buffer = (spritebatch_internal_sprite_t *) new_data;
+		sb->input_capacity = new_capacity;
+	}
+
+	cf_threadpool_add_task_block(tp, [](void *elements, int i, void *udata) {
+		const CF_Sprite* sprites = (const CF_Sprite*)elements;
+		CF_Draw* draw = (CF_Draw*)udata;
+
+		const CF_Sprite *sprite = sprites + i;
+		spritebatch_sprite_t s = {};
+		if (sprite->animation) {
+			s.image_id = sprite->animation->frames[sprite->frame_index].id;
+		} else {
+			s.image_id = sprite->easy_sprite_id;
+		}
+		s.w = sprite->w;
+		s.h = sprite->h;
+		s.geom.type = BATCH_GEOMETRY_TYPE_SPRITE;
+
+		v2 p = cf_add_v2(sprite->transform.p,
+						 cf_mul_v2(sprite->local_offset, sprite->scale));
+
+		// Expand sprite's scale to account for border pixels in the atlas.
+		v2 scale = V2(sprite->scale.x * s.w, sprite->scale.y * s.h);
+		scale.x = scale.x + (scale.x / (float) sprite->w) * 2.0f;
+		scale.y = scale.y + (scale.y / (float) sprite->h) * 2.0f;
+
+		CF_V2 quad[] = {
+				{-0.5f, 0.5f},
+				{0.5f,  0.5f},
+				{0.5f,  -0.5f},
+				{-0.5f, -0.5f},
+		};
+
+		// Construct quad in local space.
+		for (int j = 0; j < 4; ++j) {
+			float x = quad[j].x;
+			float y = quad[j].y;
+
+			x *= scale.x;
+			y *= scale.y;
+
+			float x0 = sprite->transform.r.c * x - sprite->transform.r.s * y;
+			float y0 = sprite->transform.r.s * x + sprite->transform.r.c * y;
+			x = x0;
+			y = y0;
+
+			x += p.x;
+			y += p.y;
+
+			quad[j].x = x;
+			quad[j].y = y;
+		}
+
+		CF_M3x2 m = draw->mvp;
+		s.geom.a = mul(m, quad[0]);
+		s.geom.b = mul(m, quad[1]);
+		s.geom.c = mul(m, quad[2]);
+		s.geom.d = mul(m, quad[3]);
+		s.geom.is_sprite = true;
+
+		s.geom.color = premultiply(pixel_white());
+		s.geom.alpha = sprite->opacity;
+		s.geom.user_params = draw->user_params.last();
+		s.sort_bits = draw->layers.last();
+		spritebatch_set(&draw->sb, s, draw->sb.input_count - i  - 1);
+
+	}, (void *)sprites, sprites_count, draw);
+	cf_threadpool_kick_and_wait(tp);
+}
 
 void cf_draw_sprite(const CF_Sprite* sprite)
 {

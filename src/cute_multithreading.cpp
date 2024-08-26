@@ -15,6 +15,8 @@
 #define CUTE_THREAD_ALLOC CF_ALLOC
 #define CUTE_THREAD_FREE CF_FREE
 #include <cute/cute_sync.h>
+#include <cute_c_runtime.h>
+#include <cute_math.h>
 
 CF_Mutex cf_make_mutex()
 {
@@ -241,6 +243,51 @@ CF_Threadpool* cf_make_threadpool(int thread_count)
 void cf_threadpool_add_task(CF_Threadpool* pool, CF_TaskFn* task, void* param)
 {
 	cute_threadpool_add_task(pool, task, param);
+}
+
+struct CF_TaskBlockParams
+{
+	int start, end;
+	void *elements;
+
+	CF_TaskBlockFn *fn;
+	void *udata;
+};
+
+void cf_threadpool_internal_block_task(void *udata)
+{
+	CF_TaskBlockParams* params = (CF_TaskBlockParams*)udata;
+	for (int i = params->start; i< params->end; i++) {
+		params->fn(params->elements, i, params->udata);
+	}
+}
+
+void cf_threadpool_add_task_block(CF_Threadpool *tp, CF_TaskBlockFn *fn, void *elements, int elements_count, void *udata)
+{
+	const int task_count = cf_core_count();
+	const int slice_size = (int)CF_CEILF(elements_count / (float)task_count);
+
+	static CF_TaskBlockParams params[64] = {};
+	CF_ASSERT(task_count <= 64);
+
+	for (int i = 0; i < task_count; i++) {
+		const int start = slice_size * i;
+		const int end   = cf_min(start + slice_size, elements_count);
+
+		if (start >= end) {
+			break;
+		}
+
+		params[i] = {
+			.start = start,
+			.end = end,
+			.elements = elements,
+			.fn = fn,
+			.udata = udata
+		};
+
+		cf_threadpool_add_task(tp, cf_threadpool_internal_block_task, params + i);
+	}
 }
 
 void cf_threadpool_kick_and_wait(CF_Threadpool* pool)
