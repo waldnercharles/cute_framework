@@ -23,6 +23,9 @@
 struct CF_Draw* s_draw;
 static const char* s_text_without_markups = NULL;
 
+// Thread-local context pointer for lock-free per-thread command building
+thread_local struct CF_DrawThreadContext* tl_draw_ctx = nullptr;
+
 //#define SPRITEBATCH_LOG printf
 #define SPRITEBATCH_IMPLEMENTATION
 #include <cute/cute_spritebatch.h>
@@ -78,7 +81,7 @@ void cf_destroy_texture_handle(SPRITEBATCH_U64 texture_id, void* udata)
 
 spritebatch_t* cf_get_draw_sb()
 {
-	return &s_draw->sb;
+	return &s_draw->shared->sb;
 }
 
 void cf_get_pixels(SPRITEBATCH_U64 image_id, void* buffer, int bytes_to_fill, void* udata)
@@ -124,8 +127,8 @@ static void s_draw_report(spritebatch_sprite_t* sprites, int count, int texture_
 {
 	CF_UNUSED(udata);
 	int vert_count = 0;
-	s_draw->verts.ensure_count(count * 6);
-	CF_Vertex* verts = s_draw->verts.data();
+	s_draw->shared->verts.ensure_count(count * 6);
+	CF_Vertex* verts = s_draw->shared->verts.data();
 	CF_MEMSET(verts, 0, sizeof(CF_Vertex) * count * 6);
 
 	for (int i = 0; i < count; ++i) {
@@ -341,32 +344,32 @@ static void s_draw_report(spritebatch_sprite_t* sprites, int count, int texture_
 	}
 
 	// Allow users to optionally modulate vertices.
-	if (s_draw->vertex_fn) {
-		s_draw->vertex_fn(verts, vert_count);
+	if (s_get_thread_context()->vertex_fn) {
+		s_get_thread_context()->vertex_fn(verts, vert_count);
 	}
 
-	CF_Command& cmd = s_draw->cmds[s_draw->cmd_index];
+	CF_Command& cmd = *s_draw->shared->current_cmd;
 
 	// Map the vertex buffer with sprite vertex data.
-	cf_mesh_update_vertex_data(s_draw->mesh, verts, vert_count);
-	cf_apply_mesh(s_draw->mesh);
+	cf_mesh_update_vertex_data(s_draw->shared->mesh, verts, vert_count);
+	cf_apply_mesh(s_draw->shared->mesh);
 
 	// Apply the atlas texture.
 	CF_Texture atlas = { sprites->texture_id };
-	cf_material_set_texture_fs(s_draw->material, "u_image", atlas);
+	cf_material_set_texture_fs(s_draw->shared->material, "u_image", atlas);
 
 	// Apply uniforms.
 	v2 u_texture_size = cf_v2((float)texture_w, (float)texture_h);
-	cf_material_set_uniform_fs(s_draw->material, "u_texture_size", &u_texture_size, CF_UNIFORM_TYPE_FLOAT2, 1);
+	cf_material_set_uniform_fs(s_draw->shared->material, "u_texture_size", &u_texture_size, CF_UNIFORM_TYPE_FLOAT2, 1);
 	v2 u_texel_size = cf_v2(1.0f / (float)texture_w, 1.0f / (float)texture_h);
-	cf_material_set_uniform_fs(s_draw->material, "u_texel_size", &u_texel_size, CF_UNIFORM_TYPE_FLOAT2, 1);
-	cf_material_set_uniform_fs(s_draw->material, "u_alpha_discard", &cmd.alpha_discard, CF_UNIFORM_TYPE_INT, 1);
+	cf_material_set_uniform_fs(s_draw->shared->material, "u_texel_size", &u_texel_size, CF_UNIFORM_TYPE_FLOAT2, 1);
+	cf_material_set_uniform_fs(s_draw->shared->material, "u_alpha_discard", &cmd.alpha_discard, CF_UNIFORM_TYPE_INT, 1);
 
 	// Apply render state.
-	cf_material_set_render_state(s_draw->material, cmd.render_state);
+	cf_material_set_render_state(s_draw->shared->material, cmd.render_state);
 
 	// Kick off a draw call.
-	cf_apply_shader(cmd.shader, s_draw->material);
+	cf_apply_shader(cmd.shader, s_draw->shared->material);
 
 	// Apply viewport.
 	CF_Rect viewport = cmd.viewport;
@@ -382,7 +385,98 @@ static void s_draw_report(spritebatch_sprite_t* sprites, int count, int texture_
 
 	cf_draw_elements();
 
-	s_draw->has_drawn_something = true;
+	s_draw->shared->has_drawn_something = true;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Thread context management for thread-safe drawing
+
+CF_Command& CF_DrawThreadContext::add_cmd()
+{
+	CF_Command& cmd = cmds.add();
+	// Atomically increment global order counter for cross-thread command sorting
+	cmd.id = cf_atomic_add(&s_draw->shared->draw_item_order, 1);
+	cmd.layer = layers.last();
+	cmd.scissor = scissors.last();
+	cmd.viewport = viewports.last();
+	cmd.alpha_discard = alpha_discards.last();
+	cmd.render_state = render_states.last();
+	cmd.shader = shaders.last();
+	return cmd;
+}
+
+CF_DrawThreadContext* s_create_thread_context()
+{
+	CF_DrawThreadContext* ctx = CF_NEW(CF_DrawThreadContext);
+
+	// Initialize uniform arena
+	ctx->uniform_arena = cf_make_arena(32, CF_MB);
+
+	// Copy initial projection from shared state
+	ctx->projection = s_draw->shared->mesh.id ? ortho_2d(0, 0, (float)app->w, (float)app->h) : cf_make_identity();
+	ctx->mvp = ctx->projection;
+
+	// Initialize render states with default
+	CF_RenderState state = cf_render_state_defaults();
+	state.blend.enabled = true;
+	state.blend.rgb_src_blend_factor = CF_BLENDFACTOR_ONE;
+	state.blend.rgb_dst_blend_factor = CF_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+	state.blend.rgb_op = CF_BLEND_OP_ADD;
+	state.blend.alpha_src_blend_factor = CF_BLENDFACTOR_ONE;
+	state.blend.alpha_dst_blend_factor = CF_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+	state.blend.alpha_op = CF_BLEND_OP_ADD;
+	ctx->render_states.add(state);
+
+	// Initialize shaders (will be properly set during cf_make_draw)
+	if (s_draw->shared->mesh.id) {
+		ctx->shaders.add(app->draw_shader);
+	}
+
+	// Create initial command
+	ctx->add_cmd();
+
+	return ctx;
+}
+
+void s_destroy_thread_context(CF_DrawThreadContext* ctx)
+{
+	if (!ctx) return;
+
+	cf_destroy_arena(&ctx->uniform_arena);
+	ctx->~CF_DrawThreadContext();
+	CF_FREE(ctx);
+}
+
+CF_DrawThreadContext* s_get_thread_context()
+{
+	if (!tl_draw_ctx) {
+		tl_draw_ctx = s_create_thread_context();
+
+		// Register with shared state
+		cf_mutex_lock(&s_draw->shared->context_registry_lock);
+		s_draw->shared->thread_contexts.add(tl_draw_ctx);
+		cf_mutex_unlock(&s_draw->shared->context_registry_lock);
+	}
+	return tl_draw_ctx;
+}
+
+void CF_DrawThreadContext::reset_cam()
+{
+	cam_stack.clear();
+	cam_stack.add(cf_make_identity());
+	mvp = projection;
+	antialias_scale.set_count(1);
+	set_aaf();
+}
+
+// Sets the anti-alias factor, the width of roughly one pixel scaled.
+// This factor remains constant-size despite zooming in/out with the camera.
+void CF_DrawThreadContext::set_aaf()
+{
+	float on_or_off = antialias.last() ? 1.0f : 0.0f;
+	float inv_cam_scale = 1.0f / len(cam_stack.last().m.y);
+	float scale = antialias_scale.last();
+	aaf = scale * inv_cam_scale * on_or_off;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -402,42 +496,30 @@ static void s_init_sb(int w, int h)
 	config.lonely_buffer_count_till_flush = 0;
 	config.atlas_height_in_pixels = w;
 	config.atlas_width_in_pixels = h;
-	s_draw->atlas_dims = V2((float)w, (float)h);
+	s_draw->shared->atlas_dims = V2((float)w, (float)h);
 
-	if (spritebatch_init(&s_draw->sb, &config, NULL)) {
+	if (spritebatch_init(&s_draw->shared->sb, &config, NULL)) {
+		CF_FREE(s_draw->shared);
 		CF_FREE(s_draw);
 		s_draw = NULL;
 		CF_ASSERT(false);
 	}
 }
 
-void CF_Draw::reset_cam()
-{
-	cam_stack.clear();
-	cam_stack.add(cf_make_identity());
-	mvp = projection;
-	s_draw->antialias_scale.set_count(1);
-	s_draw->set_aaf();
-}
-
-// Sets the anti-alias factor, the width of roughly one pixel scaled.
-// This factor remains constant-size despite zooming in/out with the camera.
-void CF_Draw::set_aaf()
-{
-	float on_or_off = s_draw->antialias.last() ? 1.0f : 0.0f;
-	float inv_cam_scale = 1.0f / len(s_draw->cam_stack.last().m.y);
-	float scale = s_draw->antialias_scale.last();
-	aaf = scale * inv_cam_scale * on_or_off;
-}
-
 void cf_make_draw()
 {
+	// Allocate main structure and shared state
 	s_draw = CF_NEW(CF_Draw);
-	s_draw->projection = ortho_2d(0, 0, (float)app->w, (float)app->h);
-	s_draw->reset_cam();
-	s_draw->uniform_arena = cf_make_arena(32, CF_MB);
+	s_draw->shared = CF_NEW(CF_DrawShared);
 
-	// Mesh + vertex attributes.
+	// Initialize synchronization primitives
+	s_draw->shared->sb_push_lock = cf_make_mutex();
+	s_draw->shared->sb_render_lock = cf_make_mutex();
+	s_draw->shared->map_lock = cf_make_rw_lock();
+	s_draw->shared->context_registry_lock = cf_make_mutex();
+	s_draw->shared->draw_item_order = cf_atomic_zero();
+
+	// Mesh + vertex attributes (shared, render thread only)
 	Array<CF_VertexAttribute> attrs;
 	attrs.add({
 		.name = "in_pos",
@@ -522,13 +604,10 @@ void cf_make_draw()
 		.format = CF_VERTEX_FORMAT_FLOAT4,
 		.offset = CF_OFFSET_OF(CF_Vertex, attributes),
 	});
-	s_draw->mesh = cf_make_mesh(CF_MB * 5, attrs.data(), attrs.count(), sizeof(CF_Vertex));
+	s_draw->shared->mesh = cf_make_mesh(CF_MB * 5, attrs.data(), attrs.count(), sizeof(CF_Vertex));
 
-	// Shaders.
-	s_draw->shaders.add(app->draw_shader);
-
-	// Material.
-	s_draw->material = cf_make_material();
+	// Material (shared, render thread only)
+	s_draw->shared->material = cf_make_material();
 	CF_RenderState state = cf_render_state_defaults();
 	state.blend.enabled = true;
 	state.blend.rgb_src_blend_factor = CF_BLENDFACTOR_ONE;
@@ -537,24 +616,53 @@ void cf_make_draw()
 	state.blend.alpha_src_blend_factor = CF_BLENDFACTOR_ONE;
 	state.blend.alpha_dst_blend_factor = CF_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
 	state.blend.alpha_op = CF_BLEND_OP_ADD;
-	s_draw->render_states.add(state);
-	cf_material_set_render_state(s_draw->material, state);
+	cf_material_set_render_state(s_draw->shared->material, state);
 
-	// Spritebatcher.
+	// Spritebatcher (shared, synchronized)
 	s_init_sb(2048, 2048);
 
-	// Create an initial draw command.
-	s_draw->add_cmd();
+	// Create initial thread context for main thread
+	// This will automatically register itself
+	CF_DrawThreadContext* main_ctx = s_get_thread_context();
+
+	// Initialize main thread projection and shader
+	main_ctx->projection = ortho_2d(0, 0, (float)app->w, (float)app->h);
+	main_ctx->reset_cam();
+	main_ctx->shaders.add(app->draw_shader);
 }
 
 void cf_destroy_draw()
 {
-	if (s_draw->blit_init) {
-		cf_destroy_mesh(s_draw->blit_mesh);
+	// Destroy all thread contexts
+	cf_mutex_lock(&s_draw->shared->context_registry_lock);
+	for (int i = 0; i < s_draw->shared->thread_contexts.count(); ++i) {
+		s_destroy_thread_context(s_draw->shared->thread_contexts[i]);
 	}
-	spritebatch_term(&s_draw->sb);
-	cf_destroy_mesh(s_draw->mesh);
-	cf_destroy_material(s_draw->material);
+	s_draw->shared->thread_contexts.clear();
+	cf_mutex_unlock(&s_draw->shared->context_registry_lock);
+
+	// Clean up thread-local pointer (main thread)
+	tl_draw_ctx = nullptr;
+
+	// Destroy spritebatch
+	spritebatch_term(&s_draw->shared->sb);
+
+	// Destroy graphics resources
+	if (s_draw->shared->blit_init) {
+		cf_destroy_mesh(s_draw->shared->blit_mesh);
+	}
+	cf_destroy_mesh(s_draw->shared->mesh);
+	cf_destroy_material(s_draw->shared->material);
+
+	// Destroy synchronization primitives
+	cf_destroy_mutex(&s_draw->shared->sb_push_lock);
+	cf_destroy_mutex(&s_draw->shared->sb_render_lock);
+	cf_destroy_rw_lock(&s_draw->shared->map_lock);
+	cf_destroy_mutex(&s_draw->shared->context_registry_lock);
+
+	// Free memory
+	s_draw->shared->~CF_DrawShared();
+	CF_FREE(s_draw->shared);
 	s_draw->~CF_Draw();
 	CF_FREE(s_draw);
 }
@@ -578,7 +686,7 @@ void cf_draw_sprite(const CF_Sprite* sprite)
 	if (sprite->animation) {
 		s.image_id = sprite->animation->frames[sprite->frame_index].id;
 	} else if (sprite->easy_sprite_id >= CF_PREMADE_ID_RANGE_LO && sprite->easy_sprite_id <= CF_PREMADE_ID_RANGE_HI) {
-		CF_AtlasSubImage sub_image = s_draw->premade_sub_image_id_to_sub_image.find(sprite->easy_sprite_id);
+		CF_AtlasSubImage sub_image = s_draw->shared->premade_sub_image_id_to_sub_image.find(sprite->easy_sprite_id);
 		s.minx = sub_image.minx;
 		s.maxx = sub_image.maxx;
 		s.miny = sub_image.miny;
@@ -630,7 +738,7 @@ void cf_draw_sprite(const CF_Sprite* sprite)
 		quad[j].y = y;
 	}
 
-	CF_M3x2 m = s_draw->mvp;
+	CF_M3x2 m = s_get_thread_context()->mvp;
 	s.geom.shape[0] = mul(m, quad[0]);
 	s.geom.shape[1] = mul(m, quad[1]);
 	s.geom.shape[2] = mul(m, quad[2]);
@@ -638,7 +746,7 @@ void cf_draw_sprite(const CF_Sprite* sprite)
 	s.geom.is_sprite = true;
 	s.geom.color = premultiply(pixel_white());
 	s.geom.alpha = sprite->opacity;
-	s.geom.user_params = s_draw->user_params.last();
+	s.geom.user_params = s_get_thread_context()->user_params.last();
 	DRAW_PUSH_ITEM(s);
 }
 
@@ -819,7 +927,7 @@ void cf_draw_sprite_9_slice(const CF_Sprite* sprite)
 				quad[j].y = y;
 			}
 
-			CF_M3x2 m = s_draw->mvp;
+			CF_M3x2 m = s_get_thread_context()->mvp;
 			s.geom.shape[0] = mul(m, quad[0]);
 			s.geom.shape[1] = mul(m, quad[1]);
 			s.geom.shape[2] = mul(m, quad[2]);
@@ -827,7 +935,7 @@ void cf_draw_sprite_9_slice(const CF_Sprite* sprite)
 			s.geom.is_sprite = true;
 			s.geom.color = premultiply(pixel_white());
 			s.geom.alpha = sprite->opacity;
-			s.geom.user_params = s_draw->user_params.last();
+			s.geom.user_params = s_get_thread_context()->user_params.last();
 			s.image_id = image_id;
 			DRAW_PUSH_ITEM(s);
 		}
@@ -1010,7 +1118,7 @@ void cf_draw_sprite_9_slice_tiled(const CF_Sprite* sprite)
 			quad[j].y = y;
 		}
 
-		CF_M3x2 m = s_draw->mvp;
+		CF_M3x2 m = s_get_thread_context()->mvp;
 		s.geom.shape[0] = mul(m, quad[0]);
 		s.geom.shape[1] = mul(m, quad[1]);
 		s.geom.shape[2] = mul(m, quad[2]);
@@ -1018,7 +1126,7 @@ void cf_draw_sprite_9_slice_tiled(const CF_Sprite* sprite)
 		s.geom.is_sprite = true;
 		s.geom.color = premultiply(pixel_white());
 		s.geom.alpha = sprite->opacity;
-		s.geom.user_params = s_draw->user_params.last();
+		s.geom.user_params = s_get_thread_context()->user_params.last();
 		s.image_id = image_id;
 		DRAW_PUSH_ITEM(s);
 	};
@@ -1123,20 +1231,20 @@ void cf_draw_prefetch(const CF_Sprite* sprite)
 			const CF_Animation* animation = sprite->animations[i];
 			for (int j = 0; j < asize(animation->frames); ++j) {
 				CF_Frame* frame = animation->frames + j;
-				spritebatch_prefetch(&s_draw->sb, frame->id, sprite->w, sprite->h);
+				spritebatch_prefetch(&s_draw->shared->sb, frame->id, sprite->w, sprite->h);
 			}
 		}
 	} else if (sprite->easy_sprite_id >= CF_PREMADE_ID_RANGE_LO && sprite->easy_sprite_id <= CF_PREMADE_ID_RANGE_HI) {
-		spritebatch_prefetch(&s_draw->sb, sprite->easy_sprite_id, sprite->w, sprite->h);
+		spritebatch_prefetch(&s_draw->shared->sb, sprite->easy_sprite_id, sprite->w, sprite->h);
 	} else {
-		spritebatch_prefetch(&s_draw->sb, sprite->easy_sprite_id, sprite->w, sprite->h);
+		spritebatch_prefetch(&s_draw->shared->sb, sprite->easy_sprite_id, sprite->w, sprite->h);
 	}
 }
 
 static void s_draw_quad(CF_V2 p0, CF_V2 p1, CF_V2 p2, CF_V2 p3, float stroke, float radius, bool fill)
 {
-	CF_M3x2 m = s_draw->mvp;
-	float aaf = s_draw->aaf;
+	CF_M3x2 m = s_get_thread_context()->mvp;
+	float aaf = s_get_thread_context()->aaf;
 	spritebatch_sprite_t s = { };
 	s.image_id = app->default_image_id;
 	s.w = s.h = 1;
@@ -1163,13 +1271,13 @@ static void s_draw_quad(CF_V2 p0, CF_V2 p1, CF_V2 p2, CF_V2 p3, float stroke, fl
 	s.geom.shape[0] = c;
 	s.geom.shape[1] = he;
 	s.geom.shape[2] = u;
-	s.geom.color = premultiply(to_pixel(s_draw->colors.last()));
+	s.geom.color = premultiply(to_pixel(s_get_thread_context()->colors.last()));
 	s.geom.alpha = 1.0f;
 	s.geom.radius = radius;
 	s.geom.stroke = stroke;
 	s.geom.fill = fill;
 	s.geom.aa = aaf;
-	s.geom.user_params = s_draw->user_params.last();
+	s.geom.user_params = s_get_thread_context()->user_params.last();
 	DRAW_PUSH_ITEM(s);
 }
 
@@ -1221,8 +1329,8 @@ void cf_draw_quad_fill2(CF_V2 p0, CF_V2 p1, CF_V2 p2, CF_V2 p3, float chubbiness
 
 static void s_draw_circle(v2 position, float stroke, float radius, bool fill)
 {
-	CF_M3x2 m = s_draw->mvp;
-	float aaf = s_draw->aaf;
+	CF_M3x2 m = s_get_thread_context()->mvp;
+	float aaf = s_get_thread_context()->aaf;
 	spritebatch_sprite_t s = { };
 	s.image_id = app->default_image_id;
 	s.w = s.h = 1;
@@ -1243,13 +1351,13 @@ static void s_draw_circle(v2 position, float stroke, float radius, bool fill)
 	s.geom.shape[0] = position;
 	s.geom.shape[1] = position;
 	s.geom.shape[2] = position;
-	s.geom.color = premultiply(to_pixel(s_draw->colors.last()));
+	s.geom.color = premultiply(to_pixel(s_get_thread_context()->colors.last()));
 	s.geom.alpha = 1.0f;
 	s.geom.radius = radius;
 	s.geom.stroke = stroke;
 	s.geom.fill = fill;
 	s.geom.aa = aaf;
-	s.geom.user_params = s_draw->user_params.last();
+	s.geom.user_params = s_get_thread_context()->user_params.last();
 	DRAW_PUSH_ITEM(s);
 }
 
@@ -1275,7 +1383,7 @@ void cf_draw_circle_fill2(CF_V2 position, float radius)
 
 static CF_INLINE void s_bounding_box_of_capsule(v2 a, v2 b, float radius, float stroke, v2 out[4])
 {
-	float aaf = s_draw->aaf;
+	float aaf = s_get_thread_context()->aaf;
 	v2 n0 = norm(b - a) * (radius + stroke + aaf);
 	v2 n1 = skew(n0);
 	out[0] = a - n0 + n1;
@@ -1286,7 +1394,7 @@ static CF_INLINE void s_bounding_box_of_capsule(v2 a, v2 b, float radius, float 
 
 static void s_draw_capsule(v2 a, v2 b, float stroke, float radius, bool fill)
 {
-	CF_M3x2 m = s_draw->mvp;
+	CF_M3x2 m = s_get_thread_context()->mvp;
 	spritebatch_sprite_t s = { };
 	s.image_id = app->default_image_id;
 	s.w = s.h = 1;
@@ -1300,13 +1408,13 @@ static void s_draw_capsule(v2 a, v2 b, float stroke, float radius, bool fill)
 	s.geom.shape[0] = a;
 	s.geom.shape[1] = b;
 	s.geom.shape[2] = a;
-	s.geom.color = premultiply(to_pixel(s_draw->colors.last()));
+	s.geom.color = premultiply(to_pixel(s_get_thread_context()->colors.last()));
 	s.geom.alpha = 1.0f;
 	s.geom.radius = radius;
 	s.geom.stroke = stroke;
 	s.geom.fill = fill;
-	s.geom.aa = s_draw->aaf;
-	s.geom.user_params = s_draw->user_params.last();
+	s.geom.aa = s_get_thread_context()->aaf;
+	s.geom.user_params = s_get_thread_context()->user_params.last();
 	DRAW_PUSH_ITEM(s);
 }
 
@@ -1352,7 +1460,7 @@ void CF_INLINE s_bounding_box_of_triangle(v2 a, v2 b, v2 c, float radius, float 
 		out[2] = b + u * inflate + v * (inflate + h);
 		out[3] = a - u * inflate + v * (inflate + h);
 	};
-	float aaf = s_draw->aaf;
+	float aaf = s_get_thread_context()->aaf;
 	if (d0 >= d1 && d0 >= d2) {
 		build_box(d0, a, b, c, radius + stroke + aaf, out);
 	} else if (d1 >= d0 && d1 >= d2) {
@@ -1364,12 +1472,12 @@ void CF_INLINE s_bounding_box_of_triangle(v2 a, v2 b, v2 c, float radius, float 
 
 static void s_draw_tri(v2 a, v2 b, v2 c, float stroke, float radius, bool fill)
 {
-	CF_M3x2 m = s_draw->mvp;
+	CF_M3x2 m = s_get_thread_context()->mvp;
 	spritebatch_sprite_t s = { };
 	s.image_id = app->default_image_id;
 	s.w = s.h = 1;
 
-	if (stroke > 0 || radius > 0 || !fill || s_draw->antialias.last()) {
+	if (stroke > 0 || radius > 0 || !fill || s_get_thread_context()->antialias.last()) {
 		s.geom.type = BATCH_GEOMETRY_TYPE_TRI_SDF;
 		s_bounding_box_of_triangle(a, b, c, radius, stroke, s.geom.box);
 		s.geom.box[0] = s.geom.box[0];
@@ -1390,13 +1498,13 @@ static void s_draw_tri(v2 a, v2 b, v2 c, float stroke, float radius, bool fill)
 		s.geom.shape[2] = mul(m, c);
 	}
 
-	s.geom.color = premultiply(to_pixel(s_draw->colors.last()));
+	s.geom.color = premultiply(to_pixel(s_get_thread_context()->colors.last()));
 	s.geom.alpha = 1.0f;
 	s.geom.radius = radius;
 	s.geom.stroke = stroke;
 	s.geom.fill = fill;
-	s.geom.aa = s_draw->aaf;
-	s.geom.user_params = s_draw->user_params.last();
+	s.geom.aa = s_get_thread_context()->aaf;
+	s.geom.user_params = s_get_thread_context()->user_params.last();
 	DRAW_PUSH_ITEM(s);
 }
 
@@ -1428,21 +1536,21 @@ void cf_draw_polyline(const CF_V2* pts, int count, float thickness, bool loop)
 	}
 
 	// Each portion of the polyline will be rendered with a single triangle per spritebatch entry.
-	CF_M3x2 m = s_draw->mvp;
+	CF_M3x2 m = s_get_thread_context()->mvp;
 	spritebatch_sprite_t s = { };
 	s.image_id = app->default_image_id;
-	s.geom.color = premultiply(to_pixel(s_draw->colors.last()));
+	s.geom.color = premultiply(to_pixel(s_get_thread_context()->colors.last()));
 	s.geom.alpha = 1.0f;
 	s.geom.radius = radius;
 	s.geom.stroke = 0;
 	s.geom.fill = true;
-	s.geom.aa = s_draw->aaf;
+	s.geom.aa = s_get_thread_context()->aaf;
 	s.geom.type = BATCH_GEOMETRY_TYPE_SEGMENT;
-	s.geom.user_params = s_draw->user_params.last();
+	s.geom.user_params = s_get_thread_context()->user_params.last();
 	s.w = s.h = 1;
 
 	// Expand to account for aa.
-	radius += s_draw->aaf;
+	radius += s_get_thread_context()->aaf;
 
 	int i2 = 2;
 	v2 p0 = pts[0];
@@ -1597,13 +1705,13 @@ void cf_draw_polyline(const CF_V2* pts, int count, float thickness, bool loop)
 void cf_draw_polygon_fill(const CF_V2* points, int count, float chubbiness)
 {
 	CF_ASSERT(count >= 3 && count <= 8);
-	CF_M3x2 m = s_draw->mvp;
+	CF_M3x2 m = s_get_thread_context()->mvp;
 	spritebatch_sprite_t s = { };
 	s.image_id = app->default_image_id;
 	s.w = s.h = 1;
 
 	s.geom.type = BATCH_GEOMETRY_TYPE_POLYGON;
-	CF_Aabb bb = expand(make_aabb(points, count), s_draw->aaf+chubbiness);
+	CF_Aabb bb = expand(make_aabb(points, count), s_get_thread_context()->aaf+chubbiness);
 	CF_V2 box[4];
 	aabb_verts(box, bb);
 	s.geom.box[0] = box[0];
@@ -1619,11 +1727,11 @@ void cf_draw_polygon_fill(const CF_V2* points, int count, float chubbiness)
 		s.geom.shape[i] = points[i];
 	}
 
-	s.geom.color = premultiply(to_pixel(s_draw->colors.last()));
+	s.geom.color = premultiply(to_pixel(s_get_thread_context()->colors.last()));
 	s.geom.alpha = 1.0f;
 	s.geom.radius = chubbiness;
-	s.geom.aa = s_draw->aaf;
-	s.geom.user_params = s_draw->user_params.last();
+	s.geom.aa = s_get_thread_context()->aaf;
+	s.geom.user_params = s_get_thread_context()->user_params.last();
 	DRAW_PUSH_ITEM(s);
 }
 
@@ -1732,30 +1840,30 @@ void cf_draw_polygon_fill_simple(const CF_V2* points, int count)
 
 void cf_draw_bezier_line(CF_V2 a, CF_V2 c0, CF_V2 b, int iters, float thickness)
 {
-	s_draw->temp.ensure_capacity(iters);
-	s_draw->temp.clear();
+	s_get_thread_context()->temp.ensure_capacity(iters);
+	s_get_thread_context()->temp.clear();
 	float step = 1.0f / (float)iters;
-	s_draw->temp.add(a);
+	s_get_thread_context()->temp.add(a);
 	for (int i = 1; i < iters; ++i) {
 		CF_V2 p = cf_bezier(a, c0, b, i * step);
-		s_draw->temp.add(p);
+		s_get_thread_context()->temp.add(p);
 	}
-	s_draw->temp.add(b);
-	cf_draw_polyline(s_draw->temp.data(), s_draw->temp.count(), thickness, false);
+	s_get_thread_context()->temp.add(b);
+	cf_draw_polyline(s_get_thread_context()->temp.data(), s_get_thread_context()->temp.count(), thickness, false);
 }
 
 void cf_draw_bezier_line2(CF_V2 a, CF_V2 c0, CF_V2 c1, CF_V2 b, int iters, float thickness)
 {
-	s_draw->temp.ensure_capacity(iters);
-	s_draw->temp.clear();
+	s_get_thread_context()->temp.ensure_capacity(iters);
+	s_get_thread_context()->temp.clear();
 	float step = 1.0f / (float)iters;
-	s_draw->temp.add(a);
+	s_get_thread_context()->temp.add(a);
 	for (int i = 1; i < iters; ++i) {
 		CF_V2 p = cf_bezier2(a, c0, c1, b, i * step);
-		s_draw->temp.add(p);
+		s_get_thread_context()->temp.add(p);
 	}
-	s_draw->temp.add(b);
-	cf_draw_polyline(s_draw->temp.data(), s_draw->temp.count(), thickness, false);
+	s_get_thread_context()->temp.add(b);
+	cf_draw_polyline(s_get_thread_context()->temp.data(), s_get_thread_context()->temp.count(), thickness, false);
 }
 
 void cf_draw_arrow(CF_V2 a, CF_V2 b, float thickness, float arrow_width)
@@ -2006,135 +2114,135 @@ float cf_font_get_kern(CF_Font* font, float font_size, int code0, int code1)
 
 void cf_push_font(const char* font)
 {
-	s_draw->fonts.add(sintern(font));
+	s_get_thread_context()->fonts.add(sintern(font));
 }
 
 const char* cf_pop_font()
 {
-	if (s_draw->fonts.count() > 1) {
-		return s_draw->fonts.pop();
+	if (s_get_thread_context()->fonts.count() > 1) {
+		return s_get_thread_context()->fonts.pop();
 	} else {
-		return s_draw->fonts.last();
+		return s_get_thread_context()->fonts.last();
 	}
 }
 
 const char* cf_peek_font()
 {
-	return s_draw->fonts.last();
+	return s_get_thread_context()->fonts.last();
 }
 
 void cf_push_font_size(float size)
 {
-	s_draw->font_sizes.add(size);
+	s_get_thread_context()->font_sizes.add(size);
 }
 
 float cf_pop_font_size()
 {
-	if (s_draw->font_sizes.count() > 1) {
-		return s_draw->font_sizes.pop();
+	if (s_get_thread_context()->font_sizes.count() > 1) {
+		return s_get_thread_context()->font_sizes.pop();
 	} else {
-		return s_draw->font_sizes.last();
+		return s_get_thread_context()->font_sizes.last();
 	}
 }
 
 float cf_peek_font_size()
 {
-	return s_draw->font_sizes.last();
+	return s_get_thread_context()->font_sizes.last();
 }
 
 void cf_push_font_blur(int blur)
 {
-	s_draw->blurs.add(blur);
+	s_get_thread_context()->blurs.add(blur);
 }
 
 int cf_pop_font_blur()
 {
-	if (s_draw->blurs.count() > 1) {
-		return s_draw->blurs.pop();
+	if (s_get_thread_context()->blurs.count() > 1) {
+		return s_get_thread_context()->blurs.pop();
 	} else {
-		return s_draw->blurs.last();
+		return s_get_thread_context()->blurs.last();
 	}
 }
 
 int cf_peek_font_blur()
 {
-	return s_draw->blurs.last();
+	return s_get_thread_context()->blurs.last();
 }
 
 void cf_push_text_wrap_width(float width)
 {
-	s_draw->text_wrap_widths.add(width);
+	s_get_thread_context()->text_wrap_widths.add(width);
 }
 
 float cf_pop_text_wrap_width()
 {
-	if (s_draw->text_wrap_widths.count() > 1) {
-		return s_draw->text_wrap_widths.pop();
+	if (s_get_thread_context()->text_wrap_widths.count() > 1) {
+		return s_get_thread_context()->text_wrap_widths.pop();
 	} else {
-		return s_draw->text_wrap_widths.last();
+		return s_get_thread_context()->text_wrap_widths.last();
 	}
 }
 
 float cf_peek_text_wrap_width()
 {
-	return s_draw->text_wrap_widths.last();
+	return s_get_thread_context()->text_wrap_widths.last();
 }
 
 void cf_push_text_vertical_layout(bool layout_vertically)
 {
-	s_draw->vertical.add(layout_vertically);
+	s_get_thread_context()->vertical.add(layout_vertically);
 }
 
 bool cf_pop_text_vertical_layout()
 {
-	if (s_draw->vertical.count() > 1) {
-		return s_draw->vertical.pop();
+	if (s_get_thread_context()->vertical.count() > 1) {
+		return s_get_thread_context()->vertical.pop();
 	} else {
-		return s_draw->vertical.last();
+		return s_get_thread_context()->vertical.last();
 	}
 }
 
 bool cf_peek_text_vertical_layout()
 {
-	return s_draw->vertical.last();
+	return s_get_thread_context()->vertical.last();
 }
 
 void cf_push_text_id(uint64_t id)
 {
-	s_draw->text_ids.add(id);
+	s_get_thread_context()->text_ids.add(id);
 }
 
 uint64_t cf_pop_text_id()
 {
-	if (s_draw->text_ids.count() > 1) {
-		return s_draw->text_ids.pop();
+	if (s_get_thread_context()->text_ids.count() > 1) {
+		return s_get_thread_context()->text_ids.pop();
 	} else {
-		return s_draw->text_ids.last();
+		return s_get_thread_context()->text_ids.last();
 	}
 }
 
 uint64_t cf_peek_text_id()
 {
-	return s_draw->text_ids.last();
+	return s_get_thread_context()->text_ids.last();
 }
 
 void cf_push_text_effect_active(bool text_effects_on)
 {
-	s_draw->text_effects.add(text_effects_on);
+	s_get_thread_context()->text_effects.add(text_effects_on);
 }
 
 bool cf_pop_text_effect_active()
 {
-	if (s_draw->text_effects.count() > 1) {
-		return s_draw->text_effects.pop();
+	if (s_get_thread_context()->text_effects.count() > 1) {
+		return s_get_thread_context()->text_effects.pop();
 	} else {
-		return s_draw->text_effects.last();
+		return s_get_thread_context()->text_effects.last();
 	}
 }
 
 bool cf_peek_text_effect_active()
 {
-	return s_draw->text_effects.last();
+	return s_get_thread_context()->text_effects.last();
 }
 
 static v2 s_draw_text(const char* text, CF_V2 position, int text_length, bool render = true, cf_text_markup_info_fn* markups = NULL);
@@ -2175,8 +2283,8 @@ static bool s_is_space(int cp)
 
 static const char* s_find_end_of_line(CF_Font* font, const char* text, float wrap_width)
 {
-	float font_size = s_draw->font_sizes.last();
-	int blur = s_draw->blurs.last();
+	float font_size = s_get_thread_context()->font_sizes.last();
+	int blur = s_get_thread_context()->blurs.last();
 	float x = 0;
 	const char* start_of_word = 0;
 	float word_w = 0;
@@ -2466,7 +2574,7 @@ static bool s_text_fx_strike(CF_TextEffect* fx_ptr)
 		strike.p0 = fx->center - hw;
 		strike.p1 = fx->center + hw;
 		strike.thickness = h;
-		s_draw->strikes.add(strike);
+		s_get_thread_context()->strikes.add(strike);
 	}
 	return true;
 }
@@ -2509,12 +2617,12 @@ static void s_parse_codes(CF_ParsedTextState* text_state, const char* text)
 
 static v2 s_draw_text(const char* text, CF_V2 position, int text_length, bool render, cf_text_markup_info_fn* markups)
 {
-	CF_Font* font = cf_font_get(s_draw->fonts.last());
+	CF_Font* font = cf_font_get(s_get_thread_context()->fonts.last());
 	CF_ASSERT(font);
 	if (!font) return V2(0,0);
 
 	// Text id can be custom or based on text's content
-	uint64_t text_id = s_draw->text_ids.last();
+	uint64_t text_id = s_get_thread_context()->text_ids.last();
 	uint64_t text_hash = fnv1a(text, (int)CF_STRLEN(text) + 1);
 	if (text_id == 0) { text_id = text_hash; }
 
@@ -2538,15 +2646,15 @@ static v2 s_draw_text(const char* text, CF_V2 position, int text_length, bool re
 	}
 
 	// Use the sanitized string for rendering. This excludes all text codes.
-	bool do_effects = s_draw->text_effects.last();
+	bool do_effects = s_get_thread_context()->text_effects.last();
 	if (do_effects) {
 		text = text_state->sanitized.c_str();
 	}
 
 	// Gather up all state required for rendering.
-	float font_size = s_draw->font_sizes.last();
-	int blur = s_draw->blurs.last();
-	float wrap_w = s_draw->text_wrap_widths.last();
+	float font_size = s_get_thread_context()->font_sizes.last();
+	int blur = s_get_thread_context()->blurs.last();
+	float wrap_w = s_get_thread_context()->text_wrap_widths.last();
 	float scale = stbtt_ScaleForPixelHeight(&font->info, font_size);
 	float line_height = font->line_height * scale;
 	int cp_prev = 0;
@@ -2557,8 +2665,8 @@ static v2 s_draw_text(const char* text, CF_V2 position, int text_length, bool re
 
 	// @NOTE -- Not 100% sure snapping to pixel is the best thing here, but it really does make
 	// text rendering feel a lot more robust, especially for nearest-neighbor rendering.
-	float inv_cam_scale_y = 1.0f / len(s_draw->cam_stack.last().m.y);
-	float inv_cam_scale_x = 1.0f / len(s_draw->cam_stack.last().m.x);
+	float inv_cam_scale_y = 1.0f / len(s_get_thread_context()->cam_stack.last().m.y);
+	float inv_cam_scale_x = 1.0f / len(s_get_thread_context()->cam_stack.last().m.x);
 	float x = CF_ROUNDF(position.x * inv_cam_scale_x);
 	float initial_y = CF_ROUNDF((position.y - font->ascent * scale) * inv_cam_scale_y);
 	float y = initial_y;
@@ -2622,7 +2730,7 @@ static v2 s_draw_text(const char* text, CF_V2 position, int text_length, bool re
 		++index;
 	};
 
-	bool vertical = s_draw->vertical.last();
+	bool vertical = s_get_thread_context()->vertical.last();
 
 	auto advance_to_next_glyph = [&](CF_Glyph* last_glyph) {
 		// Max bound covers the entire glyph without kerning so we use w instead
@@ -2719,7 +2827,7 @@ static v2 s_draw_text(const char* text, CF_V2 position, int text_length, bool re
 			s.h = glyph->h;
 			s.geom.type = BATCH_GEOMETRY_TYPE_SPRITE;
 			s.geom.alpha = 1.0f;
-			CF_Color color = s_draw->colors.last();
+			CF_Color color = s_get_thread_context()->colors.last();
 
 			uint64_t kern_key = CF_KERN_KEY(cp_prev, cp);
 			v2 kern = V2(cf_font_get_kern(font, font_size, cp_prev, cp), 0);
@@ -2781,7 +2889,7 @@ static v2 s_draw_text(const char* text, CF_V2 position, int text_length, bool re
 
 			// Actually render the sprite.
 			if (visible && render) {
-				CF_M3x2 m = s_draw->mvp;
+				CF_M3x2 m = s_get_thread_context()->mvp;
 				s.geom.shape[0] = mul(m, V2(q0.x, q1.y));
 				s.geom.shape[1] = mul(m, V2(q1.x, q1.y));
 				s.geom.shape[2] = mul(m, V2(q1.x, q0.y));
@@ -2802,14 +2910,14 @@ static v2 s_draw_text(const char* text, CF_V2 position, int text_length, bool re
 
 	if (render) {
 		// Draw strike-lines just after the text.
-		for (int i = 0; i < s_draw->strikes.size(); ++i) {
-			v2 p0 = s_draw->strikes[i].p0;
-			v2 p1 = s_draw->strikes[i].p1;
-			float thickness = s_draw->strikes[i].thickness;
+		for (int i = 0; i < s_get_thread_context()->strikes.size(); ++i) {
+			v2 p0 = s_get_thread_context()->strikes[i].p0;
+			v2 p1 = s_get_thread_context()->strikes[i].p1;
+			float thickness = s_get_thread_context()->strikes[i].thickness;
 			cf_draw_line(p0, p1, thickness);
 		}
 	}
-	s_draw->strikes.clear();
+	s_get_thread_context()->strikes.clear();
 
 	return V2(max_x - position.x, position.y - min_y);
 }
@@ -2869,95 +2977,100 @@ int cf_draw_pop_layer()
 
 int cf_draw_peek_layer()
 {
-	return s_draw->layers.last();
+	return s_get_thread_context()->layers.last();
 }
 
 void cf_draw_push_color(CF_Color c)
 {
-	s_draw->colors.add(c);
+	s_get_thread_context()->colors.add(c);
 }
 
 CF_Color cf_draw_pop_color()
 {
-	if (s_draw->colors.count() > 1) {
-		return s_draw->colors.pop();
+	CF_DrawThreadContext* ctx = s_get_thread_context();
+	if (ctx->colors.count() > 1) {
+		return ctx->colors.pop();
 	} else {
-		return s_draw->colors.last();
+		return ctx->colors.last();
 	}
 }
 
 CF_Color cf_draw_peek_color()
 {
-	return s_draw->colors.last();
+	return s_get_thread_context()->colors.last();
 }
 
 void cf_draw_push_antialias(bool antialias)
 {
-	s_draw->antialias.add(antialias);
-	s_draw->set_aaf();
+	CF_DrawThreadContext* ctx = s_get_thread_context();
+	ctx->antialias.add(antialias);
+	ctx->set_aaf();
 }
 
 bool cf_draw_pop_antialias()
 {
-	if (s_draw->antialias.count() > 1) {
-		bool result = s_draw->antialias.pop();
-		s_draw->set_aaf();
+	CF_DrawThreadContext* ctx = s_get_thread_context();
+	if (ctx->antialias.count() > 1) {
+		bool result = ctx->antialias.pop();
+		ctx->set_aaf();
 		return result;
 	} else {
-		return s_draw->antialias.last();
+		return ctx->antialias.last();
 	}
 }
 
 bool cf_draw_peek_antialias()
 {
-	return s_draw->antialias.last();
+	return s_get_thread_context()->antialias.last();
 }
 
 void cf_draw_push_antialias_scale(float scale)
 {
-	s_draw->antialias_scale.add(scale);
-	s_draw->set_aaf();
+	CF_DrawThreadContext* ctx = s_get_thread_context();
+	ctx->antialias_scale.add(scale);
+	ctx->set_aaf();
 }
 
 float cf_draw_pop_antialias_scale()
 {
-	if (s_draw->antialias_scale.count() > 1) {
-		float scale = s_draw->antialias_scale.pop();
-		s_draw->set_aaf();
+	CF_DrawThreadContext* ctx = s_get_thread_context();
+	if (ctx->antialias_scale.count() > 1) {
+		float scale = ctx->antialias_scale.pop();
+		ctx->set_aaf();
 		return scale;
 	} else {
-		return s_draw->antialias_scale.last();
+		return ctx->antialias_scale.last();
 	}
 }
 
 float cf_draw_peek_antialias_scale()
 {
-	return s_draw->antialias_scale.last();
+	return s_get_thread_context()->antialias_scale.last();
 }
 
 void cf_draw_push_vertex_attributes(float r, float g, float b, float a)
 {
-	s_draw->user_params.add(cf_make_color_rgba_f(r, g, b, a));
+	s_get_thread_context()->user_params.add(cf_make_color_rgba_f(r, g, b, a));
 }
 
 void cf_draw_push_vertex_attributes2(CF_Color attributes)
 {
-	s_draw->user_params.add(attributes);
+	s_get_thread_context()->user_params.add(attributes);
 }
 
 CF_Color cf_draw_pop_vertex_attributes()
 {
-	return s_draw->user_params.count() > 1 ? s_draw->user_params.pop() : s_draw->user_params.last();
+	return s_get_thread_context()->user_params.count() > 1 ? s_get_thread_context()->user_params.pop() : s_get_thread_context()->user_params.last();
 }
 
 CF_Color cf_draw_peek_vertex_attributes()
 {
-	return s_draw->user_params.last();
+	return s_get_thread_context()->user_params.last();
 }
 
 void cf_set_vertex_callback(CF_VertexFn* vertex_fn)
 {
-	s_draw->vertex_fn = vertex_fn;
+	s_get_thread_context()->vertex_fn = vertex_fn;
 }
 
 void cf_draw_push_viewport(CF_Rect viewport)
@@ -2972,7 +3085,7 @@ CF_Rect cf_draw_pop_viewport()
 
 CF_Rect cf_draw_peek_viewport()
 {
-	return s_draw->viewports.last();
+	return s_get_thread_context()->viewports.last();
 }
 
 void cf_draw_push_scissor(CF_Rect scissor)
@@ -2987,7 +3100,7 @@ CF_Rect cf_draw_pop_scissor()
 
 CF_Rect cf_draw_peek_scissor()
 {
-	return s_draw->scissors.last();
+	return s_get_thread_context()->scissors.last();
 }
 
 void cf_draw_push_render_state(CF_RenderState render_state)
@@ -3002,17 +3115,17 @@ CF_RenderState cf_draw_pop_render_state()
 
 CF_RenderState cf_draw_peek_render_state()
 {
-	return s_draw->render_states.last();
+	return s_get_thread_context()->render_states.last();
 }
 
 void cf_draw_set_atlas_dimensions(int width_in_pixels, int height_in_pixels)
 {
-	spritebatch_term(&s_draw->sb);
+	spritebatch_term(&s_draw->shared->sb);
 	s_init_sb(width_in_pixels, height_in_pixels);
-	s_draw->atlas_dims.x = (float)width_in_pixels;
-	s_draw->atlas_dims.y = (float)height_in_pixels;
-	s_draw->texel_dims.x = 1.0f / s_draw->atlas_dims.x;
-	s_draw->texel_dims.y = 1.0f / s_draw->atlas_dims.y;
+	s_draw->shared->atlas_dims.x = (float)width_in_pixels;
+	s_draw->shared->atlas_dims.y = (float)height_in_pixels;
+	s_draw->shared->texel_dims.x = 1.0f / s_draw->shared->atlas_dims.x;
+	s_draw->shared->texel_dims.y = 1.0f / s_draw->shared->atlas_dims.y;
 }
 
 CF_Shader cf_make_draw_shader(const char* path)
@@ -3020,7 +3133,7 @@ CF_Shader cf_make_draw_shader(const char* path)
 	// Also make an attached blit shader to apply when drawing canvases.
 	CF_Shader blit_shd = cf_make_draw_blit_shader_internal(path);
 	CF_Shader draw_shd = cf_make_draw_shader_internal(path);
-	s_draw->draw_shd_to_blit_shd.add(draw_shd.id, blit_shd.id);
+	s_draw->shared->draw_shd_to_blit_shd.add(draw_shd.id, blit_shd.id);
 	return draw_shd;
 }
 
@@ -3029,7 +3142,7 @@ CF_Shader cf_make_draw_shader_from_source(const char* src)
 	// Also make an attached blit shader to apply when drawing canvases.
 	CF_Shader blit_shd = cf_make_draw_blit_shader_from_source_internal(src);
 	CF_Shader draw_shd = cf_make_draw_shader_from_source_internal(src);
-	s_draw->draw_shd_to_blit_shd.add(draw_shd.id, blit_shd.id);
+	s_draw->shared->draw_shd_to_blit_shd.add(draw_shd.id, blit_shd.id);
 	return draw_shd;
 }
 
@@ -3038,7 +3151,7 @@ CF_Shader cf_make_draw_shader_from_bytecode(CF_DrawShaderBytecode bytecode)
 	// Also make an attached blit shader to apply when drawing canvases.
 	CF_Shader blit_shd = cf_make_draw_blit_shader_from_bytecode_internal(bytecode.blit_shader);
 	CF_Shader draw_shd = cf_make_draw_shader_from_bytecode_internal(bytecode.draw_shader);
-	s_draw->draw_shd_to_blit_shd.add(draw_shd.id, blit_shd.id);
+	s_draw->shared->draw_shd_to_blit_shd.add(draw_shd.id, blit_shd.id);
 	return draw_shd;
 }
 
@@ -3055,7 +3168,7 @@ CF_Shader cf_draw_pop_shader()
 
 CF_Shader cf_draw_peek_shader()
 {
-	return s_draw->shaders.last();
+	return s_get_thread_context()->shaders.last();
 }
 
 // In cute_graphics.cpp.
@@ -3080,7 +3193,7 @@ bool cf_draw_pop_alpha_discard()
 
 bool cf_draw_peek_alpha_discard()
 {
-	return s_draw->alpha_discards.last() == 0 ? false : true;
+	return s_get_thread_context()->alpha_discards.last() == 0 ? false : true;
 }
 
 void cf_draw_set_texture(const char* name, CF_Texture texture)
@@ -3099,7 +3212,7 @@ void cf_draw_set_uniform(const char* name, void* data, CF_UniformType type, int 
 	u.type = type;
 	u.array_length = array_length;
 	u.size = s_uniform_size(type) * array_length;
-	u.data = cf_arena_alloc(&s_draw->uniform_arena, u.size);
+	u.data = cf_arena_alloc(&s_get_thread_context()->uniform_arena, u.size);
 	CF_MEMCPY(u.data, data, u.size);
 	ADD_UNIFORM(u);
 }
@@ -3111,7 +3224,7 @@ void cf_draw_set_uniform_int(const char* name, int val)
 	u.type = CF_UNIFORM_TYPE_INT;
 	u.array_length = 1;
 	u.size = s_uniform_size(CF_UNIFORM_TYPE_INT);
-	u.data = cf_arena_alloc(&s_draw->uniform_arena, u.size);
+	u.data = cf_arena_alloc(&s_get_thread_context()->uniform_arena, u.size);
 	CF_ASSERT(u.size == sizeof(val));
 	CF_MEMCPY(u.data, &val, u.size);
 	ADD_UNIFORM(u);
@@ -3124,7 +3237,7 @@ void cf_draw_set_uniform_float(const char* name, float val)
 	u.type = CF_UNIFORM_TYPE_FLOAT;
 	u.array_length = 1;
 	u.size = s_uniform_size(CF_UNIFORM_TYPE_FLOAT);
-	u.data = cf_arena_alloc(&s_draw->uniform_arena, u.size);
+	u.data = cf_arena_alloc(&s_get_thread_context()->uniform_arena, u.size);
 	CF_ASSERT(u.size == sizeof(val));
 	CF_MEMCPY(u.data, &val, u.size);
 	ADD_UNIFORM(u);
@@ -3137,7 +3250,7 @@ void cf_draw_set_uniform_v2(const char* name, CF_V2 val)
 	u.type = CF_UNIFORM_TYPE_FLOAT2;
 	u.array_length = 1;
 	u.size = s_uniform_size(CF_UNIFORM_TYPE_FLOAT2);
-	u.data = cf_arena_alloc(&s_draw->uniform_arena, u.size);
+	u.data = cf_arena_alloc(&s_get_thread_context()->uniform_arena, u.size);
 	CF_ASSERT(u.size == sizeof(val));
 	CF_MEMCPY(u.data, &val, u.size);
 	ADD_UNIFORM(u);
@@ -3150,7 +3263,7 @@ void cf_draw_set_uniform_color(const char* name, CF_Color val)
 	u.type = CF_UNIFORM_TYPE_FLOAT4;
 	u.array_length = 1;
 	u.size = s_uniform_size(CF_UNIFORM_TYPE_FLOAT4);
-	u.data = cf_arena_alloc(&s_draw->uniform_arena, u.size);
+	u.data = cf_arena_alloc(&s_get_thread_context()->uniform_arena, u.size);
 	CF_ASSERT(u.size == sizeof(val));
 	CF_MEMCPY(u.data, &val, u.size);
 	ADD_UNIFORM(u);
@@ -3158,7 +3271,7 @@ void cf_draw_set_uniform_color(const char* name, CF_Color val)
 
 void cf_draw_canvas(CF_Canvas canvas, CF_V2 position, CF_V2 scale)
 {
-	CF_Command& cmd = s_draw->add_cmd();
+	CF_Command& cmd = s_get_thread_context()->add_cmd();
 	cmd.is_canvas = true;
 	cmd.canvas = canvas;
 	CF_Aabb bb = make_aabb(position, fabsf(scale.x), fabsf(scale.y));
@@ -3179,9 +3292,9 @@ void cf_draw_canvas(CF_Canvas canvas, CF_V2 position, CF_V2 scale)
 		swap(cmd.canvas_verts[1], cmd.canvas_verts[2]);
 	}
 	for (int i = 0; i < 4; ++i) {
-		cmd.canvas_verts_posH[i] = mul(s_draw->mvp, cmd.canvas_verts[i]);
+		cmd.canvas_verts_posH[i] = mul(s_get_thread_context()->mvp, cmd.canvas_verts[i]);
 	}
-	cmd.canvas_attributes = s_draw->user_params.last();
+	cmd.canvas_attributes = s_get_thread_context()->user_params.last();
 }
 
 void static s_blit(CF_Command* cmd, CF_Canvas src, CF_Canvas dst, bool clear_dst)
@@ -3194,8 +3307,8 @@ void static s_blit(CF_Command* cmd, CF_Canvas src, CF_Canvas dst, bool clear_dst
 		CF_Color params;
 	} Vertex;
 
-	if (!s_draw->blit_init) {
-		s_draw->blit_init = true;
+	if (!s_draw->shared->blit_init) {
+		s_draw->shared->blit_init = true;
 
 		// Create a full-screen quad mesh.
 		CF_VertexAttribute attrs[4] = { 0 };
@@ -3212,11 +3325,11 @@ void static s_blit(CF_Command* cmd, CF_Canvas src, CF_Canvas dst, bool clear_dst
 		attrs[3].format = CF_VERTEX_FORMAT_FLOAT4;
 		attrs[3].offset = CF_OFFSET_OF(Vertex, params);
 		CF_Mesh blit_mesh = cf_make_mesh(sizeof(Vertex) * 1024, attrs, CF_ARRAY_SIZE(attrs), sizeof(Vertex));
-		s_draw->blit_mesh = blit_mesh;
+		s_draw->shared->blit_mesh = blit_mesh;
 	}
 
 	// Try and fetch a custom shader supplied by the user, otherwise fallback to the default blit shader.
-	CF_Shader* blit = (CF_Shader*)s_draw->draw_shd_to_blit_shd.try_get(cmd->shader.id);
+	CF_Shader* blit = (CF_Shader*)s_draw->shared->draw_shd_to_blit_shd.try_get(cmd->shader.id);
 	if (!blit) {
 		CF_ASSERT(app->blit_shader.id);
 		blit = (CF_Shader*)&app->blit_shader;
@@ -3253,24 +3366,24 @@ void static s_blit(CF_Command* cmd, CF_Canvas src, CF_Canvas dst, bool clear_dst
 	verts[4].uv = V2(1,0);
 	verts[5].uv = V2(0,0);
 
-	cf_mesh_update_vertex_data(s_draw->blit_mesh, verts, 6);
-	cf_apply_mesh(s_draw->blit_mesh);
+	cf_mesh_update_vertex_data(s_draw->shared->blit_mesh, verts, 6);
+	cf_apply_mesh(s_draw->shared->blit_mesh);
 
 	// Read pixels from src.
-	cf_material_set_texture_fs(s_draw->material, "u_image", cf_canvas_get_target(src));
+	cf_material_set_texture_fs(s_draw->shared->material, "u_image", cf_canvas_get_target(src));
 
 	// Apply uniforms.
 	int w, h;
 	cf_canvas_get_size(cmd->canvas, &w, &h);
 	v2 canvas_dims = V2((float)w, (float)h);
-	cf_material_set_uniform_fs(s_draw->material, "u_texture_size", &canvas_dims, CF_UNIFORM_TYPE_FLOAT2, 1);
-	cf_material_set_uniform_fs(s_draw->material, "u_alpha_discard", &cmd->alpha_discard, CF_UNIFORM_TYPE_INT, 1);
+	cf_material_set_uniform_fs(s_draw->shared->material, "u_texture_size", &canvas_dims, CF_UNIFORM_TYPE_FLOAT2, 1);
+	cf_material_set_uniform_fs(s_draw->shared->material, "u_alpha_discard", &cmd->alpha_discard, CF_UNIFORM_TYPE_INT, 1);
 
 	// Apply render state.
-	cf_material_set_render_state(s_draw->material, cmd->render_state);
+	cf_material_set_render_state(s_draw->shared->material, cmd->render_state);
 
 	// Apply shader.
-	cf_apply_shader(*blit, s_draw->material);
+	cf_apply_shader(*blit, s_draw->shared->material);
 
 	// Apply viewport.
 	CF_Rect viewport = cmd->viewport;
@@ -3296,9 +3409,9 @@ static void s_process_command(CF_Canvas canvas, CF_Command* cmd, CF_Command* nex
 	// Apply uniforms.
 	CF_DrawUniform* u = &cmd->u;
 	if (u->is_texture) {
-		material_set_texture_fs(s_draw->material, u->name, u->texture);
+		material_set_texture_fs(s_draw->shared->material, u->name, u->texture);
 	} else if (u->data) {
-		cf_material_set_uniform_fs_internal(s_draw->material, "shd_uniforms", u->name, u->data, u->type, u->array_length);
+		cf_material_set_uniform_fs_internal(s_draw->shared->material, "shd_uniforms", u->name, u->data, u->type, u->array_length);
 	}
 
 	// Blit canvas.
@@ -3306,15 +3419,22 @@ static void s_process_command(CF_Canvas canvas, CF_Command* cmd, CF_Command* nex
 	if (cmd->is_canvas) {
 		s_blit(cmd, cmd->canvas, canvas, clear);
 		clear = false; // Only clear `canvas` once.
-		s_draw->has_drawn_something = true;
+		s_draw->shared->has_drawn_something = true;
 		return;
 	}
 
 	// Collate all of the drawable items into the spritebatch.
+	// Lock-free: cmd->items are from thread-local buffers, already collected
 	if (!cmd->items.count()) return;
-	s_draw->need_flush = true;
+	s_draw->shared->need_flush = true;
+
+	// Set current command pointer for s_draw_report callback
+	s_draw->shared->current_cmd = cmd;
+
+	// LOCK-FREE SPRITE BUFFERING: Push all sprites from this command
+	// Note: We're inside sb_render_lock from cf_render_layers_to, so this is safe
 	for (int j = 0; j < cmd->items.count(); ++j) {
-		spritebatch_push(&s_draw->sb, cmd->items[j]);
+		spritebatch_push(&s_draw->shared->sb, cmd->items[j]);
 	}
 
 	// Merge with the next command if identical.
@@ -3346,31 +3466,46 @@ static void s_process_command(CF_Canvas canvas, CF_Command* cmd, CF_Command* nex
 	if (!same) {
 		// Process the collated drawable items. Might get split up into multiple draw calls depending on
 		// the atlas compiler.
-		s_draw->need_flush = false;
-		if (!s_draw->delay_defrag) {
-			spritebatch_defrag(&s_draw->sb);
+		s_draw->shared->need_flush = false;
+		if (!s_draw->shared->delay_defrag) {
+			spritebatch_defrag(&s_draw->shared->sb);
 		}
-		spritebatch_flush(&s_draw->sb);
+		spritebatch_flush(&s_draw->shared->sb);
 	}
 }
 
 void cf_render_layers_to(CF_Canvas canvas, int layer_lo, int layer_hi, bool clear)
 {
-	// We will render to this canvas.
-	cf_apply_canvas(canvas, clear);
+	// STEP 1: Merge commands from all thread contexts (LOCK-FREE COLLECTION)
+	Cute::Array<CF_Command> merged_cmds;
 
-	// Sort the commands by layer first, then by age (to maintain relative ordering).
-	std::stable_sort(s_draw->cmds.begin(), s_draw->cmds.end(), [](const CF_Command& a, const CF_Command& b) {
+	cf_mutex_lock(&s_draw->shared->context_registry_lock);
+	for (int i = 0; i < s_draw->shared->thread_contexts.count(); ++i) {
+		CF_DrawThreadContext* ctx = s_draw->shared->thread_contexts[i];
+		for (int j = 0; j < ctx->cmds.count(); ++j) {
+			merged_cmds.add(ctx->cmds[j]);
+		}
+	}
+	cf_mutex_unlock(&s_draw->shared->context_registry_lock);
+
+	// STEP 2: Sort commands by layer, then by global atomic ID
+	std::stable_sort(merged_cmds.begin(), merged_cmds.end(), [](const CF_Command& a, const CF_Command& b) {
 		if (a.layer == b.layer) return a.id < b.id;
 		else return a.layer < b.layer;
 	});
 
+	// STEP 3: Lock spritebatch for rendering
+	cf_mutex_lock(&s_draw->shared->sb_render_lock);
+
+	// We will render to this canvas.
+	cf_apply_canvas(canvas, clear);
+
 	// Process each rendering command.
-	int count = s_draw->cmds.count();
+	int count = merged_cmds.count();
 	for (int i = 0; i < count; ++i) {
-		s_draw->cmd_index = i;
-		CF_Command* cmd = &s_draw->cmds[i];
-		CF_Command* next = i + 1 == count ? NULL : s_draw->cmds + (i + 1);
+		s_draw->shared->cmd_index = i;
+		CF_Command* cmd = &merged_cmds[i];
+		CF_Command* next = i + 1 == count ? NULL : &merged_cmds[i + 1];
 		if (cmd->layer >= layer_lo && cmd->layer <= layer_hi) {
 			s_process_command(canvas, cmd, next, clear);
 		} else if (cmd->layer > layer_hi) {
@@ -3379,31 +3514,47 @@ void cf_render_layers_to(CF_Canvas canvas, int layer_lo, int layer_hi, bool clea
 	}
 
 	// Reset internal state.
-	if (clear && !s_draw->has_drawn_something) {
+	if (clear && !s_draw->shared->has_drawn_something) {
 		cf_clear_canvas(canvas);
 	}
-	if (s_draw->need_flush) {
-		s_draw->need_flush = false;
-		if (!s_draw->delay_defrag) {
-			spritebatch_defrag(&s_draw->sb);
+	if (s_draw->shared->need_flush) {
+		s_draw->shared->need_flush = false;
+		if (!s_draw->shared->delay_defrag) {
+			spritebatch_defrag(&s_draw->shared->sb);
 		}
-		spritebatch_flush(&s_draw->sb);
+		spritebatch_flush(&s_draw->shared->sb);
 	}
-	s_draw->has_drawn_something = false;
-	cf_arena_reset(&s_draw->uniform_arena);
-	s_draw->verts.clear();
+	s_draw->shared->has_drawn_something = false;
 
-	// Remove commands that were processed.
-	for (int i = 0; i < s_draw->cmds.size();) {
-		if (s_draw->cmds[i].processed) {
-			s_draw->cmds.unordered_remove(i);
-		} else {
-			++i;
+	// Unlock spritebatch
+	cf_mutex_unlock(&s_draw->shared->sb_render_lock);
+
+	// Reset shared render state
+	s_draw->shared->verts.clear();
+
+	// STEP 4: Clear processed commands from all thread contexts
+	cf_mutex_lock(&s_draw->shared->context_registry_lock);
+	for (int i = 0; i < s_draw->shared->thread_contexts.count(); ++i) {
+		CF_DrawThreadContext* ctx = s_draw->shared->thread_contexts[i];
+
+		// Reset per-thread uniform arena
+		cf_arena_reset(&ctx->uniform_arena);
+
+		// Remove processed commands
+		for (int j = 0; j < ctx->cmds.size();) {
+			if (ctx->cmds[j].processed) {
+				ctx->cmds.unordered_remove(j);
+			} else {
+				++j;
+			}
+		}
+
+		// Ensure at least one default command for convenience
+		if (ctx->cmds.count() == 0) {
+			ctx->add_cmd();
 		}
 	}
-
-	// Ensure there's at least one "default" command for convenience use-cases.
-	s_draw->add_cmd();
+	cf_mutex_unlock(&s_draw->shared->context_registry_lock);
 }
 
 void cf_render_to(CF_Canvas canvas, bool clear)
@@ -3413,15 +3564,16 @@ void cf_render_to(CF_Canvas canvas, bool clear)
 
 CF_V2 cf_draw_mul(CF_V2 v)
 {
-	return mul(s_draw->cam_stack.last(), v);
+	return mul(s_get_thread_context()->cam_stack.last(), v);
 }
 
 void cf_draw_transform(CF_M3x2 m)
 {
-	m = mul(s_draw->cam_stack.last(), m);
-	s_draw->cam_stack.last() = m;
-	s_draw->mvp = mul(s_draw->projection, m);
-	s_draw->set_aaf();
+	CF_DrawThreadContext* ctx = s_get_thread_context();
+	m = mul(ctx->cam_stack.last(), m);
+	ctx->cam_stack.last() = m;
+	ctx->mvp = mul(ctx->projection, m);
+	ctx->set_aaf();
 }
 
 void cf_draw_translate(float x, float y)
@@ -3459,42 +3611,46 @@ void cf_draw_TSR(CF_V2 position, CF_V2 scale, float radians)
 
 void cf_draw_TSR_absolute(CF_V2 position, CF_V2 scale, float radians)
 {
+	CF_DrawThreadContext* ctx = s_get_thread_context();
 	CF_M3x2 m = make_transform(position, scale, radians);
-	s_draw->cam_stack.last() = m;
-	s_draw->mvp = mul(s_draw->projection, m);
-	s_draw->set_aaf();
+	ctx->cam_stack.last() = m;
+	ctx->mvp = mul(ctx->projection, m);
+	ctx->set_aaf();
 }
 
 void cf_draw_push()
 {
-	CF_M3x2 m = s_draw->cam_stack.last();
-	s_draw->cam_stack.add(m);
+	CF_DrawThreadContext* ctx = s_get_thread_context();
+	CF_M3x2 m = ctx->cam_stack.last();
+	ctx->cam_stack.add(m);
 }
 
 void cf_draw_pop()
 {
-	if (s_draw->cam_stack.size() > 1) {
-		s_draw->cam_stack.pop();
+	CF_DrawThreadContext* ctx = s_get_thread_context();
+	if (ctx->cam_stack.size() > 1) {
+		ctx->cam_stack.pop();
 	}
-	CF_M3x2 m = s_draw->cam_stack.last();
-	s_draw->mvp = mul(s_draw->projection, m);
-	s_draw->set_aaf();
+	CF_M3x2 m = ctx->cam_stack.last();
+	ctx->mvp = mul(ctx->projection, m);
+	ctx->set_aaf();
 }
 
 CF_M3x2 cf_draw_peek()
 {
-	return s_draw->cam_stack.last();
+	return s_get_thread_context()->cam_stack.last();
 }
 
 void cf_draw_projection(CF_M3x2 projection)
 {
-	s_draw->projection = projection;
-	s_draw->mvp = mul(projection, s_draw->cam_stack.last());
+	CF_DrawThreadContext* ctx = s_get_thread_context();
+	ctx->projection = projection;
+	ctx->mvp = mul(projection, ctx->cam_stack.last());
 }
 
 CF_V2 cf_world_to_screen(CF_V2 CF_V2)
 {
-	CF_V2 = mul(s_draw->mvp, CF_V2);
+	CF_V2 = mul(s_get_thread_context()->mvp, CF_V2);
 	CF_V2.x = (CF_V2.x + 1.0f) * (float)app->w * 0.5f;
 	CF_V2.y = (1.0f - CF_V2.y) * (float)app->h * 0.5f;
 	return CF_V2;
@@ -3504,7 +3660,7 @@ CF_V2 cf_screen_to_world(CF_V2 CF_V2)
 {
 	CF_V2.x = (CF_V2.x / (float)app->w) * 2.0f - 1.0f;
 	CF_V2.y = -((CF_V2.y / (float)app->h) * 2.0f - 1.0f);
-	CF_V2 = mul(invert(s_draw->mvp), CF_V2);
+	CF_V2 = mul(invert(s_get_thread_context()->mvp), CF_V2);
 	return CF_V2;
 }
 
@@ -3519,11 +3675,11 @@ CF_Aabb cf_screen_bounds_to_world()
 
 CF_TemporaryImage cf_fetch_image(const CF_Sprite* sprite)
 {
-	s_draw->delay_defrag = true;
+	s_draw->shared->delay_defrag = true;
 
 	if (sprite->easy_sprite_id >= CF_PREMADE_ID_RANGE_LO && sprite->easy_sprite_id <= CF_PREMADE_ID_RANGE_HI) {
-		CF_AtlasSubImage sub_image = s_draw->premade_sub_image_id_to_sub_image.find(sprite->easy_sprite_id);
-		spritebatch_sprite_t s = spritebatch_fetch(&s_draw->sb, sprite->easy_sprite_id, sprite->w, sprite->h);
+		CF_AtlasSubImage sub_image = s_draw->shared->premade_sub_image_id_to_sub_image.find(sprite->easy_sprite_id);
+		spritebatch_sprite_t s = spritebatch_fetch(&s_draw->shared->sb, sprite->easy_sprite_id, sprite->w, sprite->h);
 		CF_TemporaryImage image;
 		image.tex = { sub_image.image_id }; // @JANK - Hijacked to store texture_id and avoid an extra hashtable lookup.
 		image.w = sub_image.w;
@@ -3539,12 +3695,12 @@ CF_TemporaryImage cf_fetch_image(const CF_Sprite* sprite)
 			image_id = sprite->easy_sprite_id;
 		}
 		
-		spritebatch_sprite_t s = spritebatch_fetch(&s_draw->sb, image_id, sprite->w, sprite->h);
+		spritebatch_sprite_t s = spritebatch_fetch(&s_draw->shared->sb, image_id, sprite->w, sprite->h);
 		CF_TemporaryImage image;
 		image.tex = { s.texture_id };
 		image.w = sprite->w;
 		image.h = sprite->h;
-		v2 inv_dims = V2(1.0f / s_draw->atlas_dims.x, 1.0f / s_draw->atlas_dims.y);
+		v2 inv_dims = V2(1.0f / s_draw->shared->atlas_dims.x, 1.0f / s_draw->shared->atlas_dims.y);
 		s.minx += inv_dims.x;
 		s.maxx -= inv_dims.x;
 		s.miny -= inv_dims.y;
@@ -3576,9 +3732,9 @@ CF_Texture cf_register_premade_atlas(const char* png_path, int sub_image_count, 
 		s.miny = sub_images[i].miny;
 		s.maxy = sub_images[i].maxy;
 		premades.add(s);
-		s_draw->premade_sub_image_id_to_sub_image.add(s.image_id, sub_images[i]);
+		s_draw->shared->premade_sub_image_id_to_sub_image.add(s.image_id, sub_images[i]);
 	}
-	spritebatch_register_premade_atlas(&s_draw->sb, texture.id, img.w, img.h, sub_image_count, premades.data());
+	spritebatch_register_premade_atlas(&s_draw->shared->sb, texture.id, img.w, img.h, sub_image_count, premades.data());
 	image_free(&img);
 	return texture;
 }
@@ -3586,7 +3742,7 @@ CF_Texture cf_register_premade_atlas(const char* png_path, int sub_image_count, 
 CF_Sprite cf_make_premade_sprite(uint64_t image_id)
 {
 	image_id = image_id + CF_PREMADE_ID_RANGE_LO;
-	CF_AtlasSubImage sub_image = s_draw->premade_sub_image_id_to_sub_image.find(image_id);
+	CF_AtlasSubImage sub_image = s_draw->shared->premade_sub_image_id_to_sub_image.find(image_id);
 	CF_Sprite s = cf_sprite_defaults();
 	s.name = "premade_sprite";
 	s.easy_sprite_id = image_id;

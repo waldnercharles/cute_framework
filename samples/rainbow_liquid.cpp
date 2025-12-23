@@ -1,3 +1,5 @@
+#include "cute_draw.h"
+#include "cute_math.h"
 #include <cute.h>
 
 using namespace Cute;
@@ -319,6 +321,29 @@ void update(void* udata)
 	physics_update(physics, CF_DELTA_TIME_FIXED);
 }
 
+struct render_task_params_t
+{
+	int start, end;
+	particle_t *particles;
+	CF_M3x2 camera;
+};
+
+void render_task(void* udata)
+{
+	render_task_params_t* params = (render_task_params_t*)udata;
+
+	cf_draw_push();
+	cf_draw_transform(params->camera);
+	for (int i = params->start; i < params->end; i++) {
+		particle_t p = params->particles[i];
+		CF_Color color = p.color;
+		cf_draw_push_color(color);
+		cf_draw_circle_fill2(p.curr_pos, p.r);
+		cf_draw_pop_color();
+	}
+	cf_draw_pop();
+}
+
 int main(int argc, char* argv[])
 {
 	int w = 150, h = 150;
@@ -344,25 +369,39 @@ int main(int argc, char* argv[])
 		// Render
 		cf_app_get_size(&w, &h);
 
-		cf_draw_push();
-		cf_draw_scale(scale, scale);
-		cf_draw_translate(-physics.width / 2.f, -physics.height / 2.f);
+		CF_M3x2 camera = cf_make_transform_TSR(v2(-physics.width, -physics.height) * scale / 2.f, cf_v2(5), 0.f);
 
+		cf_draw_push();
+		cf_draw_transform(camera);
 		cf_draw_push_color(cf_make_color_hex(0xFFFFFF));
 		CF_Aabb bounds = cf_make_aabb(v2{ 0.f, 0.f }, v2{(float)physics.width, (float)physics.height});
 		cf_draw_box(bounds, 1.f, 0.f);
 		cf_draw_pop_color();
-
-		for (int i = 0; i < physics.particles.count(); i++) {
-			particle_t p = physics.particles[i];
-			CF_Color color = p.color;
-			cf_draw_push_color(color);
-
-			cf_draw_circle_fill2(p.curr_pos, p.r);
-			cf_draw_pop_color();
-		}
-
 		cf_draw_pop();
+
+
+		const int task_count = cf_core_count();
+		const int slice_size = (int)CF_CEILF(physics.particles.count() / (float)task_count);
+
+		static render_task_params_t render_params[64] = {};
+		CF_ASSERT(task_count <= 64);
+
+		for (int i = 0; i < task_count; i++) {
+			const int start = slice_size * i;
+			const int end = cf_min(start + slice_size, physics.particles.count());
+			if (start >= end) {
+				break;
+			}
+			render_params[i] = {
+				.start = start,
+				.end = end,
+				.particles = physics.particles.begin(),
+				.camera = camera
+			};
+			cf_threadpool_add_task(tp, render_task, render_params + i);
+		}
+		cf_threadpool_kick_and_wait(tp);
+
 		cf_app_draw_onto_screen(true);
 	}
 

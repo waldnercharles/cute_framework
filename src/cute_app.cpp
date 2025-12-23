@@ -518,9 +518,9 @@ int cf_app_draw_onto_screen(bool clear)
 	// Update the spritebatch itself.
 	// This does atlas management internally.
 	// All references to backend texture id's are now invalid (fetch_image or cf_texture_handle).
-	if (!s_draw->delay_defrag) {
-		spritebatch_tick(&s_draw->sb);
-		spritebatch_defrag(&s_draw->sb);
+	if (!s_draw->shared->delay_defrag) {
+		spritebatch_tick(&s_draw->shared->sb);
+		spritebatch_defrag(&s_draw->shared->sb);
 	}
 
 	// Render any remaining geometry in the draw API.
@@ -545,10 +545,10 @@ int cf_app_draw_onto_screen(bool clear)
 	// Do defrag down here after rendering ImGui to avoid thrashing any texture IDs. Generally we want to defrag
 	// before doing final rendering to reduce draw call count, but in the case where ImGui is rendered it's acceptable
 	// to have the perf-hit and delay until next frame.
-	if (s_draw->delay_defrag) {
-		spritebatch_tick(&s_draw->sb);
-		spritebatch_defrag(&s_draw->sb);
-		s_draw->delay_defrag = false;
+	if (s_draw->shared->delay_defrag) {
+		spritebatch_tick(&s_draw->shared->sb);
+		spritebatch_defrag(&s_draw->shared->sb);
+		s_draw->shared->delay_defrag = false;
 	}
 
 	if (app->gfx_backend_type == CF_BACKEND_TYPE_GLES3) {
@@ -559,28 +559,33 @@ int cf_app_draw_onto_screen(bool clear)
 #endif
 	}
 
-	// Clear all pushed draw parameters.
-	s_draw->alpha_discards.set_count(1);
-	s_draw->colors.set_count(1);
-	s_draw->antialias.set_count(1);
-	s_draw->antialias_scale.set_count(1);
-	s_draw->render_states.set_count(1);
-	s_draw->scissors.set_count(1);
-	s_draw->viewports.set_count(1);
-	s_draw->layers.set_count(1);
-	s_draw->reset_cam();
-	s_draw->font_sizes.set_count(1);
-	s_draw->fonts.set_count(1);
-	s_draw->blurs.set_count(1);
-	s_draw->text_wrap_widths.set_count(1);
-	s_draw->vertical.set_count(1);
-	s_draw->text_ids.set_count(1);
-	s_draw->user_params.set_count(1);
-	s_draw->shaders.set_count(1);
-	s_draw->verts.clear();
-	s_draw->draw_item_order = 0;
-	s_draw->cmds.clear();
-	s_draw->add_cmd();
+	// Clear all pushed draw parameters for the main thread context.
+	count = s_draw->shared->thread_contexts.count();
+	for (int i = 0; i < count; i++) {
+		CF_DrawThreadContext* ctx = s_draw->shared->thread_contexts[i];
+		ctx->alpha_discards.set_count(1);
+		ctx->colors.set_count(1);
+		ctx->antialias.set_count(1);
+		ctx->antialias_scale.set_count(1);
+		ctx->render_states.set_count(1);
+		ctx->scissors.set_count(1);
+		ctx->viewports.set_count(1);
+		ctx->layers.set_count(1);
+		ctx->reset_cam();
+		ctx->font_sizes.set_count(1);
+		ctx->fonts.set_count(1);
+		ctx->blurs.set_count(1);
+		ctx->text_wrap_widths.set_count(1);
+		ctx->vertical.set_count(1);
+		ctx->text_ids.set_count(1);
+		ctx->user_params.set_count(1);
+		ctx->shaders.set_count(1);
+		ctx->cmds.clear();
+		ctx->add_cmd();
+	}
+
+	s_draw->shared->verts.clear();
+	cf_atomic_set(&s_draw->shared->draw_item_order, 0);
 
 	// Report the number of draw calls.
 	int draw_call_count = app->draw_call_count;
