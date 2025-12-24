@@ -1,8 +1,8 @@
 /*
-        Cute Framework
-        Copyright (C) 2024 Randy Gaul https://randygaul.github.io/
+	Cute Framework
+	Copyright (C) 2024 Randy Gaul https://randygaul.github.io/
 
-        This software is dual-licensed with zlib or Unlicense, check LICENSE.txt
+	This software is dual-licensed with zlib or Unlicense, check LICENSE.txt
    for more info
 */
 
@@ -21,33 +21,35 @@ extern struct CF_Draw *s_draw;
 struct CF_DrawThreadContext;
 struct CF_DrawShared;
 
-enum BatchGeometryType : int {
-  BATCH_GEOMETRY_TYPE_TRI,
-  BATCH_GEOMETRY_TYPE_TRI_SDF,
-  BATCH_GEOMETRY_TYPE_QUAD,
-  BATCH_GEOMETRY_TYPE_SPRITE,
-  BATCH_GEOMETRY_TYPE_CIRCLE,
-  BATCH_GEOMETRY_TYPE_CAPSULE,
-  BATCH_GEOMETRY_TYPE_SEGMENT,
-  BATCH_GEOMETRY_TYPE_POLYGON,
+enum BatchGeometryType : int
+{
+	BATCH_GEOMETRY_TYPE_TRI,
+	BATCH_GEOMETRY_TYPE_TRI_SDF,
+	BATCH_GEOMETRY_TYPE_QUAD,
+	BATCH_GEOMETRY_TYPE_SPRITE,
+	BATCH_GEOMETRY_TYPE_CIRCLE,
+	BATCH_GEOMETRY_TYPE_CAPSULE,
+	BATCH_GEOMETRY_TYPE_SEGMENT,
+	BATCH_GEOMETRY_TYPE_POLYGON,
 };
 
-struct BatchGeometry {
-  BatchGeometryType type;
-  CF_Pixel color;
-  CF_V2 box[4];
-  CF_V2 boxH[4];
-  int n; // Only needed/used for polygon.
-  CF_V2 shape[8];
-  float alpha;
-  float radius;
-  float stroke;
-  float aa;
-  bool is_text;
-  bool is_sprite;
-  bool fill;
-  bool unused;
-  CF_Color user_params;
+struct BatchGeometry
+{
+	BatchGeometryType type;
+	CF_Pixel color;
+	CF_V2 box[4];
+	CF_V2 boxH[4];
+	int n; // Only needed/used for polygon.
+	CF_V2 shape[8];
+	float alpha;
+	float radius;
+	float stroke;
+	float aa;
+	bool is_text;
+	bool is_sprite;
+	bool fill;
+	bool unused;
+	CF_Color user_params;
 };
 
 #define SPRITEBATCH_SPRITE_GEOMETRY BatchGeometry
@@ -55,38 +57,40 @@ struct BatchGeometry {
 #define SPRITEBATCH_ASSERT CF_ASSERT
 #include <cute/cute_spritebatch.h>
 
-struct CF_Strike {
-  CF_V2 p0, p1;
-  float thickness;
+struct CF_Strike
+{
+	CF_V2 p0, p1;
+	float thickness;
 };
 
-struct CF_DrawUniform {
-  const char *name = NULL;
-  void *data = NULL;
-  int size = 0;
-  CF_UniformType type = CF_UNIFORM_TYPE_UNKNOWN;
-  int array_length = 0;
-  bool is_texture = false;
-  CF_Texture texture = {0};
+struct CF_DrawUniform
+{
+	const char *name = NULL;
+	void *data = NULL;
+	int size = 0;
+	CF_UniformType type = CF_UNIFORM_TYPE_UNKNOWN;
+	int array_length = 0;
+	bool is_texture = false;
+	CF_Texture texture = {0};
 };
 
-struct CF_Command {
-  bool processed = false;
-  int id = 0; // Simply increments for each command, used for sort ordering
-              // within a layer.
-  int layer = 0;
-  CF_Rect scissor = {0, 0, -1, -1};
-  CF_Rect viewport = {0, 0, -1, -1};
-  float alpha_discard = 1.0f;
-  CF_RenderState render_state;
-  CF_Shader shader;
-  Cute::Array<spritebatch_sprite_t> items;
-  CF_DrawUniform u;
-  bool is_canvas = false;
-  CF_Canvas canvas = {0};
-  CF_V2 canvas_verts[4];
-  CF_V2 canvas_verts_posH[4];
-  CF_Color canvas_attributes = cf_color_clear();
+struct CF_Command
+{
+	bool processed = false;
+	int id = 0; // Simply increments for each command, used for sort ordering within a layer.
+	int layer = 0;
+	CF_Rect scissor = {0, 0, -1, -1};
+	CF_Rect viewport = {0, 0, -1, -1};
+	float alpha_discard = 1.0f;
+	CF_RenderState render_state;
+	CF_Shader shader;
+	Cute::Array<spritebatch_sprite_t> items;
+	CF_DrawUniform u;
+	bool is_canvas = false;
+	CF_Canvas canvas = {0};
+	CF_V2 canvas_verts[4];
+	CF_V2 canvas_verts_posH[4];
+	CF_Color canvas_attributes = cf_color_clear();
 };
 
 // Forward declaration for thread-local accessor
@@ -97,35 +101,35 @@ CF_DrawThreadContext *s_get_thread_context();
 #define PUSH_DRAW_VAR(var) s_get_thread_context()->var##s.add(var)
 
 #define POP_DRAW_VAR(var)                                                      \
-  if (s_get_thread_context()->var##s.count() > 1) {                            \
-    auto var = s_get_thread_context()->var##s.pop();                           \
-    return var;                                                                \
-  } else {                                                                     \
-    return s_get_thread_context()->var##s.last();                              \
-  }
+	if (s_get_thread_context()->var##s.count() > 1) {                      \
+		auto var = s_get_thread_context()->var##s.pop();               \
+		return var;                                                    \
+	} else {                                                               \
+		return s_get_thread_context()->var##s.last();                  \
+	}
 
 #define PUSH_DRAW_VAR_AND_ADD_CMD_IF_NEEDED(var)                               \
-  if (s_get_thread_context()->var##s.last() != var) {                          \
-    CF_Command &cmd = s_get_thread_context()->add_cmd();                       \
-    cmd.var = var;                                                             \
-  }                                                                            \
-  PUSH_DRAW_VAR(var)
+	if (s_get_thread_context()->var##s.last() != var) {                    \
+		CF_Command &cmd = s_get_thread_context()->add_cmd();           \
+		cmd.var = var;                                                 \
+  	}                                                                      \
+  	PUSH_DRAW_VAR(var)
 
 #define POP_DRAW_VAR_AND_ADD_CMD_IF_NEEDED(var)                                \
-  if (s_get_thread_context()->var##s.count() > 1) {                            \
-    auto result = s_get_thread_context()->var##s.pop();                        \
-    if (s_get_thread_context()->var##s.last() != result) {                     \
-      CF_Command &cmd = s_get_thread_context()->add_cmd();                     \
-      cmd.var = s_get_thread_context()->var##s.last();                         \
-    }                                                                          \
-    return result;                                                             \
-  } else {                                                                     \
-    return s_get_thread_context()->var##s.last();                              \
-  }
+	if (s_get_thread_context()->var##s.count() > 1) {                      \
+		auto result = s_get_thread_context()->var##s.pop();            \
+		if (s_get_thread_context()->var##s.last() != result) {         \
+			CF_Command &cmd = s_get_thread_context()->add_cmd();   \
+			cmd.var = s_get_thread_context()->var##s.last();       \
+		}                                                              \
+		return result;                                                 \
+	} else {                                                               \
+		return s_get_thread_context()->var##s.last();                  \
+	}
 
 #define ADD_UNIFORM(u)                                                         \
-  s_get_thread_context()->add_cmd();                                           \
-  s_get_thread_context()->cmds.last().u = u
+	s_get_thread_context()->add_cmd();                                     \
+	s_get_thread_context()->cmds.last().u = u
 
 // Thread-local draw context for per-thread command building
 struct CF_DrawThreadContext {
