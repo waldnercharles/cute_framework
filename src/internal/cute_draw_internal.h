@@ -235,22 +235,20 @@ void s_destroy_thread_context(CF_DrawThreadContext *ctx);
 // We slice up a 64-bit int into lo + hi ranges to map where we can fetch pixels
 // from. This slices up the 64-bit range into 16 unique range. The ranges are
 // inclusive.
-#define CF_IMAGE_ID_RANGE_SIZE ((1ULL << 60) - 1)
-#define CF_ASEPRITE_ID_RANGE_LO (0ULL)
-#define CF_ASEPRITE_ID_RANGE_HI                                                \
-  (CF_ASEPRITE_ID_RANGE_LO + CF_IMAGE_ID_RANGE_SIZE)
-#define CF_PNG_ID_RANGE_LO (CF_ASEPRITE_ID_RANGE_HI + 1)
-#define CF_PNG_ID_RANGE_HI (CF_PNG_ID_RANGE_LO + CF_IMAGE_ID_RANGE_SIZE)
-#define CF_FONT_ID_RANGE_LO (CF_PNG_ID_RANGE_HI + 1)
-#define CF_FONT_ID_RANGE_HI (CF_FONT_ID_RANGE_LO + CF_IMAGE_ID_RANGE_SIZE)
-#define CF_EASY_ID_RANGE_LO (CF_FONT_ID_RANGE_HI + 1)
-#define CF_EASY_ID_RANGE_HI (CF_EASY_ID_RANGE_LO + CF_IMAGE_ID_RANGE_SIZE)
-#define CF_PREMADE_ID_RANGE_LO (CF_EASY_ID_RANGE_HI + 1)
-#define CF_PREMADE_ID_RANGE_HI (CF_PREMADE_ID_RANGE_LO + CF_IMAGE_ID_RANGE_SIZE)
+#define CF_IMAGE_ID_RANGE_SIZE   ((1ULL << 60) - 1)
+#define CF_ASEPRITE_ID_RANGE_LO  (0ULL)
+#define CF_ASEPRITE_ID_RANGE_HI  (CF_ASEPRITE_ID_RANGE_LO + CF_IMAGE_ID_RANGE_SIZE)
+#define CF_PNG_ID_RANGE_LO       (CF_ASEPRITE_ID_RANGE_HI + 1)
+#define CF_PNG_ID_RANGE_HI       (CF_PNG_ID_RANGE_LO      + CF_IMAGE_ID_RANGE_SIZE)
+#define CF_FONT_ID_RANGE_LO      (CF_PNG_ID_RANGE_HI      + 1)
+#define CF_FONT_ID_RANGE_HI      (CF_FONT_ID_RANGE_LO     + CF_IMAGE_ID_RANGE_SIZE)
+#define CF_EASY_ID_RANGE_LO      (CF_FONT_ID_RANGE_HI     + 1)
+#define CF_EASY_ID_RANGE_HI      (CF_EASY_ID_RANGE_LO     + CF_IMAGE_ID_RANGE_SIZE)
+#define CF_PREMADE_ID_RANGE_LO   (CF_EASY_ID_RANGE_HI     + 1)
+#define CF_PREMADE_ID_RANGE_HI   (CF_PREMADE_ID_RANGE_LO  + CF_IMAGE_ID_RANGE_SIZE)
 
-SPRITEBATCH_U64 cf_generate_texture_handle(void *pixels, int w, int h,
-                                           void *udata);
-void cf_destroy_texture_handle(SPRITEBATCH_U64 texture_id, void *udata);
-spritebatch_t *cf_get_draw_sb();
+SPRITEBATCH_U64 cf_generate_texture_handle(void* pixels, int w, int h, void* udata);
+void cf_destroy_texture_handle(SPRITEBATCH_U64 texture_id, void* udata);
+spritebatch_t* cf_get_draw_sb();
 
 #endif // CF_DRAW_INTERNAL_H
