@@ -2,8 +2,7 @@
 	Cute Framework
 	Copyright (C) 2024 Randy Gaul https://randygaul.github.io/
 
-	This software is dual-licensed with zlib or Unlicense, check LICENSE.txt
-   for more info
+	This software is dual-licensed with zlib or Unlicense, check LICENSE.txt for more info
 */
 
 #ifndef CF_DRAW_INTERNAL_H
@@ -65,13 +64,13 @@ struct CF_Strike
 
 struct CF_DrawUniform
 {
-	const char *name = NULL;
-	void *data = NULL;
+	const char* name = NULL;
+	void* data = NULL;
 	int size = 0;
 	CF_UniformType type = CF_UNIFORM_TYPE_UNKNOWN;
 	int array_length = 0;
 	bool is_texture = false;
-	CF_Texture texture = {0};
+	CF_Texture texture = { 0 };
 };
 
 struct CF_Command
@@ -79,26 +78,27 @@ struct CF_Command
 	bool processed = false;
 	int id = 0; // Simply increments for each command, used for sort ordering within a layer.
 	int layer = 0;
-	CF_Rect scissor = {0, 0, -1, -1};
-	CF_Rect viewport = {0, 0, -1, -1};
+	CF_Rect scissor = { 0, 0, -1, -1 };
+	CF_Rect viewport = { 0, 0, -1, -1 };
 	float alpha_discard = 1.0f;
 	CF_RenderState render_state;
 	CF_Shader shader;
 	Cute::Array<spritebatch_sprite_t> items;
 	CF_DrawUniform u;
 	bool is_canvas = false;
-	CF_Canvas canvas = {0};
+	CF_Canvas canvas = { 0 };
 	CF_V2 canvas_verts[4];
 	CF_V2 canvas_verts_posH[4];
 	CF_Color canvas_attributes = cf_color_clear();
 };
 
-// Forward declaration for thread-local accessor
 CF_DrawThreadContext *s_get_thread_context();
 
-#define DRAW_PUSH_ITEM(s) s_get_thread_context()->cmds.last().items.add(s)
+#define DRAW_PUSH_ITEM(s) \
+	s_get_thread_context()->cmds.last().items.add(s)
 
-#define PUSH_DRAW_VAR(var) s_get_thread_context()->var##s.add(var)
+#define PUSH_DRAW_VAR(var) \
+	s_get_thread_context()->var##s.add(var)
 
 #define POP_DRAW_VAR(var)                                                      \
 	if (s_get_thread_context()->var##s.count() > 1) {                      \
@@ -132,98 +132,97 @@ CF_DrawThreadContext *s_get_thread_context();
 	s_get_thread_context()->cmds.last().u = u
 
 // Thread-local draw context for per-thread command building
-struct CF_DrawThreadContext {
-  CF_Command &add_cmd();
+struct CF_DrawThreadContext
+{
+	CF_Command &add_cmd();
 
-  // Command buffers (thread-local)
-  Cute::Array<CF_Command> cmds;
+	// Command buffers (thread-local)
+	Cute::Array<CF_Command> cmds;
 
-  // Lock-free sprite buffering (key optimization!)
-  // Sprites are buffered per-thread with no locks, then batch-pushed during
-  // render
-  Cute::Array<spritebatch_sprite_t> pending_sprites;
+	// Lock-free sprite buffering (key optimization!)
+	// Sprites are buffered per-thread with no locks, then batch-pushed during render
+	Cute::Array<spritebatch_sprite_t> pending_sprites;
 
-  // State stacks (all thread-local for parallel command building)
-  Cute::Array<float> alpha_discards = {1.0f};
-  Cute::Array<CF_Color> colors = {cf_color_white()};
-  Cute::Array<bool> antialias = {true};
-  Cute::Array<float> antialias_scale = {1.5f};
-  Cute::Array<CF_RenderState> render_states;
-  Cute::Array<CF_Rect> scissors = {{0, 0, -1, -1}};
-  Cute::Array<CF_Rect> viewports = {{0, 0, -1, -1}};
-  Cute::Array<int> layers = {0};
-  Cute::Array<CF_M3x2> cam_stack = {cf_make_identity()};
-  Cute::Array<CF_Color> user_params = {cf_make_color_hex(0)};
-  Cute::Array<CF_Shader> shaders;
+	// State stacks (all thread-local for parallel command building)
+	Cute::Array<float> alpha_discards = {1.0f};
+	Cute::Array<CF_Color> colors = {cf_color_white()};
+	Cute::Array<bool> antialias = {true};
+	Cute::Array<float> antialias_scale = {1.5f};
+	Cute::Array<CF_RenderState> render_states;
+	Cute::Array<CF_Rect> scissors = {{0, 0, -1, -1}};
+	Cute::Array<CF_Rect> viewports = {{0, 0, -1, -1}};
+	Cute::Array<int> layers = {0};
+	Cute::Array<CF_M3x2> cam_stack = {cf_make_identity()};
+	Cute::Array<CF_Color> user_params = {cf_make_color_hex(0)};
+	Cute::Array<CF_Shader> shaders;
 
-  // Font/text state (thread-local)
-  Cute::Array<float> font_sizes = {18};
-  Cute::Array<const char *> fonts = {sintern("Calibri")};
-  Cute::Array<int> blurs = {0};
-  Cute::Array<float> text_wrap_widths = {FLT_MAX};
-  Cute::Array<bool> vertical = {false};
-  Cute::Array<uint64_t> text_ids = {0};
-  Cute::Array<bool> text_effects = {true};
+	// Font/text state (thread-local)
+	Cute::Array<float> font_sizes = {18};
+	Cute::Array<const char *> fonts = {sintern("Calibri")};
+	Cute::Array<int> blurs = {0};
+	Cute::Array<float> text_wrap_widths = {FLT_MAX};
+	Cute::Array<bool> vertical = {false};
+	Cute::Array<uint64_t> text_ids = {0};
+	Cute::Array<bool> text_effects = {true};
 
-  // Temporary storage (thread-local)
-  Cute::Array<CF_V2> temp;
-  Cute::Array<CF_Strike> strikes;
+	// Temporary storage (thread-local)
+	Cute::Array<CF_V2> temp;
+	Cute::Array<CF_Strike> strikes;
 
-  // Per-thread uniform arena
-  CF_Arena uniform_arena;
+	// Per-thread uniform arena
+	CF_Arena uniform_arena;
 
-  // Camera/projection state (thread-local)
-  CF_M3x2 projection;
-  CF_M3x2 mvp;
-  float aaf = 0;
+	// Camera/projection state (thread-local)
+	CF_M3x2 projection;
+	CF_M3x2 mvp;
+	float aaf = 0;
 
-  // Vertex function (thread-specific)
-  CF_VertexFn *vertex_fn = NULL;
+	// Vertex function (thread-specific)
+	CF_VertexFn *vertex_fn = NULL;
 
-  // Helper functions
-  void reset_cam();
-  void set_aaf();
+	// Helper functions
+	void reset_cam();
+	void set_aaf();
 };
 
-// Shared global state (synchronized across threads)
-struct CF_DrawShared {
-  // Spritebatch atlas (REQUIRES SYNCHRONIZATION)
-  spritebatch_t sb;
-  CF_Mutex sb_push_lock;   // Protects batch sprite push operations
-  CF_Mutex sb_render_lock; // Protects defrag/flush during render
-  CF_V2 atlas_dims = cf_v2(2048, 2048);
-  CF_V2 texel_dims = cf_v2(1.0f / 2048.0f, 1.0f / 2048.0f);
-  bool delay_defrag = false;
+// Shared global state
+struct CF_DrawShared
+{
+	spritebatch_t sb;
+	CF_Mutex sb_push_lock;
+	CF_Mutex sb_render_lock;
+	CF_V2 atlas_dims = cf_v2(2048, 2048);
+	CF_V2 texel_dims = cf_v2(1.0f / 2048.0f, 1.0f / 2048.0f);
+	bool delay_defrag = false;
 
-  // Global ordering counter (atomic for thread-safe command ordering)
-  CF_AtomicInt draw_item_order;
+	// Global ordering counter
+	CF_AtomicInt draw_item_order;
 
-  // Rendering resources (render thread only - no lock needed)
-  CF_Mesh mesh;
-  CF_Material material;
-  Cute::Array<CF_Vertex> verts;
-  bool blit_init = false;
-  CF_Mesh blit_mesh = {0};
+	// Rendering resources (render thread only - no lock needed)
+	CF_Mesh mesh;
+	CF_Material material;
+	Cute::Array<CF_Vertex> verts;
+	bool blit_init = false;
+	CF_Mesh blit_mesh = { 0 };
 
-  // Hash maps (read-write lock for mostly-read access pattern)
-  CF_ReadWriteLock map_lock;
-  Cute::Map<uint64_t, CF_AtlasSubImage> premade_sub_image_id_to_sub_image;
-  Cute::Map<uint64_t, uint64_t> draw_shd_to_blit_shd;
+	CF_ReadWriteLock map_lock;
+	Cute::Map<uint64_t, CF_AtlasSubImage> premade_sub_image_id_to_sub_image;
+	Cute::Map<uint64_t, uint64_t> draw_shd_to_blit_shd;
 
-  // Thread context registry (mutex protected)
-  CF_Mutex context_registry_lock;
-  Cute::Array<CF_DrawThreadContext *> thread_contexts;
+	CF_Mutex context_registry_lock;
+	Cute::Array<CF_DrawThreadContext *> thread_contexts;
 
-  // Render state (render thread only)
-  int cmd_index = 0;
-  CF_Command *current_cmd = NULL; // Pointer to currently processing command
-                                  // (for s_draw_report callback)
-  bool need_flush = false;
-  bool has_drawn_something = false;
+	// Render state (render thread only)
+	int cmd_index = 0;
+	CF_Command *current_cmd = NULL; // Pointer to currently processing command
+					// (for s_draw_report callback)
+	bool need_flush = false;
+	bool has_drawn_something = false;
 };
 
-struct CF_Draw {
-  CF_DrawShared *shared;
+struct CF_Draw
+{
+	CF_DrawShared *shared;
 };
 
 void cf_make_draw();
