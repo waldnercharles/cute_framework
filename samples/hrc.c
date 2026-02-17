@@ -16,11 +16,12 @@
 // Configuration.
 
 #define HRC_DIM           512
-#define HRC_N             9   // log2(HRC_DIM)
+#define HRC_N             9     // log2(HRC_DIM)
 #define HRC_WG            16
 #define HRC_BLUR_WG       8
-#define HRC_TRACE_CUTOFF  3   // trace levels 0,1,2 via DDA; extend levels 3..N
-#define HRC_NUM_DEBUG     8   // debug modes 0..7
+#define HRC_TRACE_CUTOFF  3     // trace levels 0,1,2 via DDA; extend levels 3..N
+#define HRC_SCALE         0.5f  // solver scale: 1.0 = full res, 0.5 = half res
+#define HRC_NUM_DEBUG     8     // debug modes 0..7
 
 //--------------------------------------------------------------------------------------------------
 // Shader loading.
@@ -63,6 +64,9 @@ typedef struct Hrc
 	CF_ComputeShader cs_composite;
 	int t_w[HRC_N + 1];
 	int debug_mode;
+	int work_dim;
+	int work_N;
+	float mip_level;
 } Hrc;
 
 Hrc hrc;
@@ -78,14 +82,18 @@ CF_StorageBuffer hrc_make_buf(int w, int h)
 	return cf_make_storage_buffer(p);
 }
 
-CF_Canvas hrc_make_canvas(int w, int h, CF_PixelFormat fmt)
+CF_Canvas hrc_make_canvas(int w, int h, CF_PixelFormat fmt, bool mipmaps)
 {
 	CF_CanvasParams p = cf_canvas_defaults(w, h);
 	p.target.pixel_format = fmt;
-	p.target.filter = CF_FILTER_NEAREST;
+	p.target.filter = CF_FILTER_LINEAR;
 	p.target.usage = CF_TEXTURE_USAGE_SAMPLER_BIT | CF_TEXTURE_USAGE_COLOR_TARGET_BIT | CF_TEXTURE_USAGE_COMPUTE_STORAGE_READ_BIT | CF_TEXTURE_USAGE_COMPUTE_STORAGE_WRITE_BIT;
 	p.target.wrap_u = CF_WRAP_MODE_CLAMP_TO_EDGE;
 	p.target.wrap_v = CF_WRAP_MODE_CLAMP_TO_EDGE;
+	if (mipmaps) {
+		p.target.allocate_mipmaps = true;
+		p.target.mip_filter = CF_MIP_FILTER_LINEAR;
+	}
 	return cf_make_canvas(p);
 }
 
@@ -136,39 +144,45 @@ void hrc_init()
 {
 	CF_MEMSET(&hrc, 0, sizeof(hrc));
 	int dim = HRC_DIM;
+	int work = (int)((float)dim * HRC_SCALE);
+	if (work < 16) work = 16;
+	hrc.work_dim = work;
+	hrc.work_N = (int)log2f((float)work);
+	if (hrc.work_N > HRC_N) hrc.work_N = HRC_N;
+	hrc.mip_level = log2f((float)dim / (float)work);
 
-	// Precompute T cascade buffer widths.
-	for (int i = 0; i <= HRC_N; i++) {
-		hrc.t_w[i] = hrc_t_width(dim, i);
+	// Precompute T cascade buffer widths (solver resolution).
+	for (int i = 0; i <= hrc.work_N; i++) {
+		hrc.t_w[i] = hrc_t_width(work, i);
 	}
 
-	// Scene input canvases.
-	hrc.emission = hrc_make_canvas(dim, dim, CF_PIXEL_FORMAT_R16G16B16A16_FLOAT);
-	hrc.transmittance = hrc_make_canvas(dim, dim, CF_PIXEL_FORMAT_R16G16B16A16_FLOAT);
+	// Scene input canvases (full resolution, mipmapped for solver downsampling).
+	hrc.emission = hrc_make_canvas(dim, dim, CF_PIXEL_FORMAT_R16G16B16A16_FLOAT, true);
+	hrc.transmittance = hrc_make_canvas(dim, dim, CF_PIXEL_FORMAT_R16G16B16A16_FLOAT, true);
 
-	// Per-cascade T SSBOs (uvec2 per texel = 8 bytes, f16-packed).
-	for (int i = 0; i <= HRC_N; i++) {
-		hrc.t_rad[i] = hrc_make_buf(hrc.t_w[i], dim);
-		hrc.t_trn[i] = hrc_make_buf(hrc.t_w[i], dim);
+	// Per-cascade T SSBOs (solver resolution, uvec2 per texel = 8 bytes, f16-packed).
+	for (int i = 0; i <= hrc.work_N; i++) {
+		hrc.t_rad[i] = hrc_make_buf(hrc.t_w[i], work);
+		hrc.t_trn[i] = hrc_make_buf(hrc.t_w[i], work);
 	}
 
 	// R ping-pong SSBOs + zero buffer for R_N = 0.
 	for (int i = 0; i < 2; i++)
-		hrc.r_rad[i] = hrc_make_buf(dim, dim);
-	hrc.r_zero = hrc_make_buf(dim, dim);
+		hrc.r_rad[i] = hrc_make_buf(work, work);
+	hrc.r_zero = hrc_make_buf(work, work);
 	{
-		int sz = dim * dim * 8;
+		int sz = work * work * 8;
 		void* zeros = cf_calloc(sz, 1);
 		cf_update_storage_buffer(hrc.r_zero, zeros, sz);
 		cf_free(zeros);
 	}
 
-	// Per-frustum output SSBOs (4 rotations).
+	// Per-frustum output SSBOs (4 rotations, solver resolution).
 	for (int i = 0; i < 4; i++)
-		hrc.frustum[i] = hrc_make_buf(dim, dim);
+		hrc.frustum[i] = hrc_make_buf(work, work);
 
 	// Precompute merge angular weights per cascade level.
-	for (int level = 0; level < HRC_N; level++) {
+	for (int level = 0; level < hrc.work_N; level++) {
 		int directions = 1 << level;
 		hrc.merge_weights[level] = hrc_make_buf(directions, 1);
 
@@ -184,12 +198,12 @@ void hrc_init()
 		cf_free(weights);
 	}
 
-	// Compute textures for post-processing.
-	hrc.radiance_preblur = hrc_make_compute_texture(dim, dim);
-	hrc.radiance = hrc_make_compute_texture(dim, dim);
+	// Compute textures for post-processing (solver resolution).
+	hrc.radiance_preblur = hrc_make_compute_texture(work, work);
+	hrc.radiance = hrc_make_compute_texture(work, work);
 
-	// Final output canvas.
-	hrc.fluence = hrc_make_canvas(dim, dim, CF_PIXEL_FORMAT_R8G8B8A8_UNORM);
+	// Final output canvas (solver resolution, upscaled on display).
+	hrc.fluence = hrc_make_canvas(work, work, CF_PIXEL_FORMAT_R8G8B8A8_UNORM, false);
 
 	// Materials.
 	hrc.mat_trace = cf_make_material();
@@ -212,7 +226,7 @@ void hrc_shutdown()
 {
 	cf_destroy_canvas(hrc.emission);
 	cf_destroy_canvas(hrc.transmittance);
-	for (int i = 0; i <= HRC_N; i++) {
+	for (int i = 0; i <= hrc.work_N; i++) {
 		cf_destroy_storage_buffer(hrc.t_rad[i]);
 		cf_destroy_storage_buffer(hrc.t_trn[i]);
 	}
@@ -221,7 +235,7 @@ void hrc_shutdown()
 	cf_destroy_storage_buffer(hrc.r_zero);
 	for (int i = 0; i < 4; i++)
 		cf_destroy_storage_buffer(hrc.frustum[i]);
-	for (int i = 0; i < HRC_N; i++)
+	for (int i = 0; i < hrc.work_N; i++)
 		cf_destroy_storage_buffer(hrc.merge_weights[i]);
 	cf_destroy_texture(hrc.radiance_preblur);
 	cf_destroy_texture(hrc.radiance);
@@ -248,11 +262,11 @@ void hrc_compute()
 	CF_Texture emiss_tex = cf_canvas_get_target(hrc.emission);
 	CF_Texture trans_tex = cf_canvas_get_target(hrc.transmittance);
 	CF_Texture fluence_tex = cf_canvas_get_target(hrc.fluence);
-	int dim = HRC_DIM;
+	int dim = hrc.work_dim;
 
 	for (int j = 0; j < 4; j++) {
 		// Trace T_0..cutoff-1 via DDA.
-		int trace_max = HRC_TRACE_CUTOFF < HRC_N ? HRC_TRACE_CUTOFF : HRC_N;
+		int trace_max = HRC_TRACE_CUTOFF < hrc.work_N ? HRC_TRACE_CUTOFF : hrc.work_N;
 		for (int level = 0; level < trace_max; level++) {
 			int rot_w = dim; // square world, so rot_w == rot_h == dim for all rotations
 			int rot_h = dim;
@@ -267,7 +281,7 @@ void hrc_compute()
 			cf_material_set_uniform_cs(hrc.mat_trace, "u_world_h", params + 3, CF_UNIFORM_TYPE_INT, 1);
 			cf_material_set_uniform_cs(hrc.mat_trace, "u_work_w", params + 4, CF_UNIFORM_TYPE_INT, 1);
 			cf_material_set_uniform_cs(hrc.mat_trace, "u_work_h", params + 5, CF_UNIFORM_TYPE_INT, 1);
-			float mip_level = 0.0f;
+			float mip_level = hrc.mip_level;
 			cf_material_set_uniform_cs(hrc.mat_trace, "u_mip_level", &mip_level, CF_UNIFORM_TYPE_FLOAT, 1);
 
 			CF_ComputeDispatch d = cf_compute_dispatch_defaults(
@@ -282,7 +296,7 @@ void hrc_compute()
 		}
 
 		// Extend T_cutoff..T_N.
-		for (int level = trace_max; level <= HRC_N; level++) {
+		for (int level = trace_max; level <= hrc.work_N; level++) {
 			int rot_w = dim;
 			int rot_h = dim;
 			int prev_w = hrc_t_width(rot_w, level - 1);
@@ -313,7 +327,7 @@ void hrc_compute()
 		int rot_w = dim;
 		int rot_h = dim;
 		int r_ping = 0;
-		for (int i = HRC_N - 1; i >= 0; i--) {
+		for (int i = hrc.work_N - 1; i >= 0; i--) {
 			int t_curr_w = hrc_t_width(rot_w, i);
 			int t_next_w = hrc_t_width(rot_w, i + 1);
 			int r_prev_w = hrc_r_width(rot_w, i + 1);
@@ -328,7 +342,7 @@ void hrc_compute()
 			cf_material_set_uniform_cs(hrc.mat_merge, "u_r_prev_w", params + 5, CF_UNIFORM_TYPE_INT, 1);
 			cf_material_set_uniform_cs(hrc.mat_merge, "u_r_curr_w", params + 6, CF_UNIFORM_TYPE_INT, 1);
 
-			CF_StorageBuffer r_prev = (i == HRC_N - 1) ? hrc.r_zero : hrc.r_rad[1 - r_ping];
+			CF_StorageBuffer r_prev = (i == hrc.work_N - 1) ? hrc.r_zero : hrc.r_rad[1 - r_ping];
 			CF_StorageBuffer r_out = (i == 0) ? hrc.frustum[j] : hrc.r_rad[r_ping];
 
 			CF_ComputeDispatch d = cf_compute_dispatch_defaults(
@@ -381,7 +395,7 @@ void hrc_compute()
 		cf_material_set_texture_cs(hrc.mat_blur, "u_transmittance", trans_tex);
 		float src_texel_size[2] = { 1.0f / (float)dim, 1.0f / (float)dim };
 		cf_material_set_uniform_cs(hrc.mat_blur, "u_src_texel_size", src_texel_size, CF_UNIFORM_TYPE_FLOAT2, 1);
-		float mip_level = 0.0f;
+		float mip_level = hrc.mip_level;
 		cf_material_set_uniform_cs(hrc.mat_blur, "u_mip_level", &mip_level, CF_UNIFORM_TYPE_FLOAT, 1);
 
 		CF_ComputeDispatch d = cf_compute_dispatch_defaults(
@@ -570,6 +584,7 @@ void draw_emission()
 	cf_draw_pop_render_state();
 	cf_clear_color(0.0f, 0.0f, 0.0f, 0.0f);
 	cf_render_to(hrc.emission, true);
+	cf_generate_mipmaps(cf_canvas_get_target(hrc.emission));
 	end_canvas_draw();
 }
 
@@ -635,6 +650,7 @@ void draw_transmittance()
 	// Clear to white (fully transparent) before drawing.
 	cf_clear_color(1.0f, 1.0f, 1.0f, 1.0f);
 	cf_render_to(hrc.transmittance, true);
+	cf_generate_mipmaps(cf_canvas_get_target(hrc.transmittance));
 	end_canvas_draw();
 }
 
@@ -663,6 +679,11 @@ int main(int argc, char* argv[])
 
 	while (cf_app_is_running()) {
 		cf_app_update(NULL);
+
+		char title[128];
+		snprintf(title, sizeof(title), "HRC - %.0f fps", cf_app_get_smoothed_framerate());
+		cf_app_set_title(title);
+
 		handle_input();
 		update_lights();
 		draw_emission();
