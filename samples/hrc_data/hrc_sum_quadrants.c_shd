@@ -1,0 +1,72 @@
+// Sum 4 quadrants from frustum SSBOs, write to radiance texture.
+//
+// Each quadrant's R_0 was computed in +x-aligned space by the merge-down phase
+// and stored in frustum[0..3]. This shader reverses the rotation, applies the
+// +1 pixel x-offset to prevent diagonal ray overlap (Sec 4.2, Fig 12), and
+// sums all four quadrants into a single radiance texture.
+//
+// Pipeline:  ... -> merge -> sum_quadrants -> blur -> composite
+//                            ^^^^^^^^^^^^^^
+
+layout(std430, set = 0, binding = 0) readonly buffer F0 { uvec2 data[]; } u_f0;
+layout(std430, set = 0, binding = 1) readonly buffer F1 { uvec2 data[]; } u_f1;
+layout(std430, set = 0, binding = 2) readonly buffer F2 { uvec2 data[]; } u_f2;
+layout(std430, set = 0, binding = 3) readonly buffer F3 { uvec2 data[]; } u_f3;
+
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D u_out;
+
+layout(set = 2, binding = 0) uniform Params
+{
+	int u_world_w;
+	int u_world_h;
+};
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+vec4 f16_load(uvec2 packed)
+{
+	return vec4(unpackHalf2x16(packed.x), unpackHalf2x16(packed.y));
+}
+
+// Inverse of trace's rotate_pixel in integer pixel space.
+// Given a world-space pixel, returns the corresponding index in
+// the rotated frustum buffer for this quadrant.
+ivec2 world_to_rotated(ivec2 p, int rot, int w, int h)
+{
+	if (rot == 1) return ivec2(p.y, w - 1 - p.x);
+	if (rot == 2) return ivec2(w - 1 - p.x, h - 1 - p.y);
+	if (rot == 3) return ivec2(h - 1 - p.y, p.x);
+	return p;
+}
+
+// Load fluence from one quadrant's frustum buffer at a rotated-space coordinate.
+vec3 F_load(int rot, ivec2 rp)
+{
+	int rot_w = (rot == 0 || rot == 2) ? u_world_w : u_world_h;
+	int rot_h = (rot == 0 || rot == 2) ? u_world_h : u_world_w;
+	if (rp.x < 0 || rp.x >= rot_w || rp.y < 0 || rp.y >= rot_h) return vec3(0.0);
+	int idx = rp.y * rot_w + rp.x;
+	vec4 val;
+	if      (rot == 0) val = f16_load(u_f0.data[idx]);
+	else if (rot == 1) val = f16_load(u_f1.data[idx]);
+	else if (rot == 2) val = f16_load(u_f2.data[idx]);
+	else               val = f16_load(u_f3.data[idx]);
+	return val.rgb;
+}
+
+void main()
+{
+	ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+	if (gid.x >= u_world_w || gid.y >= u_world_h) return;
+
+	// The +1 x-offset in rotated space prevents diagonal ray overlap between
+	// quadrants, which otherwise causes cross-shaped brightness artifacts
+	// around lights (Sec 4.2, Fig 12).
+	ivec2 r0 = world_to_rotated(gid, 0, u_world_w, u_world_h) + ivec2(1, 0);
+	ivec2 r1 = world_to_rotated(gid, 1, u_world_w, u_world_h) + ivec2(1, 0);
+	ivec2 r2 = world_to_rotated(gid, 2, u_world_w, u_world_h) + ivec2(1, 0);
+	ivec2 r3 = world_to_rotated(gid, 3, u_world_w, u_world_h) + ivec2(1, 0);
+
+	vec3 sum = F_load(0, r0) + F_load(1, r1) + F_load(2, r2) + F_load(3, r3);
+	imageStore(u_out, gid, vec4(sum * 0.25, 1.0));
+}

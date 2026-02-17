@@ -1,9 +1,10 @@
 // Holographic Radiance Cascades
 //
-// Demonstrates HRC 2D global illumination based on the Amitabha-style SSBO pipeline with f16 packing and 4-rotation frustum.
+// Demonstrates HRC 2D global illumination using the production pipeline:
+//   trace -> extend -> merge -> sum_quadrants -> blur -> composite
 //
 // Controls:
-//   D       Cycle debug modes (0=normal, 1-4=quadrant, 5=no blur, 6=emissivity, 7=absorption)
+//   D       Cycle debug modes (0=normal, 1-4=quadrant, 5=no blur, 6=emission, 7=transmittance)
 //
 // Reference: Freeman, Sannikov, Margel (2025) "Holographic Radiance Cascades"
 // https://arxiv.org/pdf/2505.02041
@@ -15,10 +16,10 @@
 // Configuration.
 
 #define HRC_DIM           512
-#define HRC_WORLD_SIZE    512
 #define HRC_N             9   // log2(HRC_DIM)
 #define HRC_WG            16
-#define HRC_ABS_THRESHOLD 0.1f
+#define HRC_BLUR_WG       8
+#define HRC_TRACE_CUTOFF  3   // trace levels 0,1,2 via DDA; extend levels 3..N
 #define HRC_NUM_DEBUG     8   // debug modes 0..7
 
 //--------------------------------------------------------------------------------------------------
@@ -31,30 +32,36 @@ CF_ComputeShader load_compute_shader(const char* path)
 	cf_free(src);
 	return cs;
 }
+
 //--------------------------------------------------------------------------------------------------
 // HRC state.
 
 typedef struct Hrc
 {
-	CF_Canvas emissivity;
-	CF_Canvas absorption;
-	CF_StorageBuffer vrays_rad[HRC_N + 1];
-	CF_StorageBuffer vrays_trn[HRC_N + 1];
+	CF_Canvas emission;
+	CF_Canvas transmittance;
+	CF_StorageBuffer t_rad[HRC_N + 1];
+	CF_StorageBuffer t_trn[HRC_N + 1];
 	CF_StorageBuffer r_rad[2];
 	CF_StorageBuffer r_zero;
 	CF_StorageBuffer frustum[4];
+	CF_StorageBuffer merge_weights[HRC_N];
+	CF_Texture radiance_preblur;
+	CF_Texture radiance;
 	CF_Canvas fluence;
-	CF_Material mat_seed;
+	CF_Material mat_trace;
 	CF_Material mat_extend;
 	CF_Material mat_merge;
+	CF_Material mat_sum_quadrants;
+	CF_Material mat_blur;
 	CF_Material mat_composite;
-	CF_Material mat_copy;
-	CF_ComputeShader cs_seed;
+	CF_ComputeShader cs_trace;
 	CF_ComputeShader cs_extend;
 	CF_ComputeShader cs_merge;
-	CF_ComputeShader cs_copy;
+	CF_ComputeShader cs_sum_quadrants;
+	CF_ComputeShader cs_blur;
 	CF_ComputeShader cs_composite;
-	int vrays_w[HRC_N + 1];
+	int t_w[HRC_N + 1];
 	int debug_mode;
 } Hrc;
 
@@ -82,9 +89,44 @@ CF_Canvas hrc_make_canvas(int w, int h, CF_PixelFormat fmt)
 	return cf_make_canvas(p);
 }
 
+CF_Texture hrc_make_compute_texture(int w, int h)
+{
+	CF_TextureParams p = cf_texture_defaults(w, h);
+	p.pixel_format = CF_PIXEL_FORMAT_R16G16B16A16_FLOAT;
+	p.usage = CF_TEXTURE_USAGE_SAMPLER_BIT | CF_TEXTURE_USAGE_COMPUTE_STORAGE_READ_BIT | CF_TEXTURE_USAGE_COMPUTE_STORAGE_WRITE_BIT;
+	p.filter = CF_FILTER_LINEAR;
+	p.wrap_u = CF_WRAP_MODE_CLAMP_TO_EDGE;
+	p.wrap_v = CF_WRAP_MODE_CLAMP_TO_EDGE;
+	return cf_make_texture(p);
+}
+
 int hrc_div_ceil(int a, int b)
 {
 	return (a + b - 1) / b;
+}
+
+int hrc_probe_count(int world_w, int level)
+{
+	int step = 1 << level;
+	return (world_w + step - 1) / step;
+}
+
+int hrc_t_width(int world_w, int level)
+{
+	return hrc_probe_count(world_w, level) * ((1 << level) + 1);
+}
+
+int hrc_r_width(int world_w, int level)
+{
+	return hrc_probe_count(world_w, level) * (1 << level);
+}
+
+float hrc_angular_span(int n, float i)
+{
+	float pow2n = (float)(1 << n);
+	float left = atan2f(2.0f * (i - 0.5f) - pow2n, pow2n);
+	float right = atan2f(2.0f * (i + 0.5f) - pow2n, pow2n);
+	return right - left;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -93,31 +135,29 @@ int hrc_div_ceil(int a, int b)
 void hrc_init()
 {
 	CF_MEMSET(&hrc, 0, sizeof(hrc));
+	int dim = HRC_DIM;
 
-	// Precompute T cascade dimensions.
+	// Precompute T cascade buffer widths.
 	for (int i = 0; i <= HRC_N; i++) {
-		int interval = 1 << i;
-		int rays = interval + 1;
-		int probes = HRC_DIM >> i;
-		hrc.vrays_w[i] = probes * rays;
+		hrc.t_w[i] = hrc_t_width(dim, i);
 	}
 
 	// Scene input canvases.
-	hrc.emissivity = hrc_make_canvas(HRC_DIM, HRC_DIM, CF_PIXEL_FORMAT_R16G16B16A16_FLOAT);
-	hrc.absorption = hrc_make_canvas(HRC_DIM, HRC_DIM, CF_PIXEL_FORMAT_R16G16B16A16_FLOAT);
+	hrc.emission = hrc_make_canvas(dim, dim, CF_PIXEL_FORMAT_R16G16B16A16_FLOAT);
+	hrc.transmittance = hrc_make_canvas(dim, dim, CF_PIXEL_FORMAT_R16G16B16A16_FLOAT);
 
 	// Per-cascade T SSBOs (uvec2 per texel = 8 bytes, f16-packed).
 	for (int i = 0; i <= HRC_N; i++) {
-		hrc.vrays_rad[i] = hrc_make_buf(hrc.vrays_w[i], HRC_DIM);
-		hrc.vrays_trn[i] = hrc_make_buf(hrc.vrays_w[i], HRC_DIM);
+		hrc.t_rad[i] = hrc_make_buf(hrc.t_w[i], dim);
+		hrc.t_trn[i] = hrc_make_buf(hrc.t_w[i], dim);
 	}
 
 	// R ping-pong SSBOs + zero buffer for R_N = 0.
 	for (int i = 0; i < 2; i++)
-		hrc.r_rad[i] = hrc_make_buf(HRC_DIM, HRC_DIM);
-	hrc.r_zero = hrc_make_buf(HRC_DIM, HRC_DIM);
+		hrc.r_rad[i] = hrc_make_buf(dim, dim);
+	hrc.r_zero = hrc_make_buf(dim, dim);
 	{
-		int sz = HRC_DIM * HRC_DIM * 8;
+		int sz = dim * dim * 8;
 		void* zeros = cf_calloc(sz, 1);
 		cf_update_storage_buffer(hrc.r_zero, zeros, sz);
 		cf_free(zeros);
@@ -125,49 +165,78 @@ void hrc_init()
 
 	// Per-frustum output SSBOs (4 rotations).
 	for (int i = 0; i < 4; i++)
-		hrc.frustum[i] = hrc_make_buf(HRC_DIM, HRC_DIM);
+		hrc.frustum[i] = hrc_make_buf(dim, dim);
+
+	// Precompute merge angular weights per cascade level.
+	for (int level = 0; level < HRC_N; level++) {
+		int directions = 1 << level;
+		hrc.merge_weights[level] = hrc_make_buf(directions, 1);
+
+		int float_count = directions * 2;
+		float* weights = (float*)cf_calloc(float_count * (int)sizeof(float), 1);
+		for (int i = 0; i < directions; i++) {
+			float j_plus = 2.0f * (float)i + 1.0f;
+			float j_minus = 2.0f * (float)i;
+			weights[i * 2 + 0] = hrc_angular_span(level + 1, j_plus + 0.5f);
+			weights[i * 2 + 1] = hrc_angular_span(level + 1, j_minus + 0.5f);
+		}
+		cf_update_storage_buffer(hrc.merge_weights[level], weights, float_count * (int)sizeof(float));
+		cf_free(weights);
+	}
+
+	// Compute textures for post-processing.
+	hrc.radiance_preblur = hrc_make_compute_texture(dim, dim);
+	hrc.radiance = hrc_make_compute_texture(dim, dim);
 
 	// Final output canvas.
-	hrc.fluence = hrc_make_canvas(HRC_DIM, HRC_DIM, CF_PIXEL_FORMAT_R8G8B8A8_UNORM);
+	hrc.fluence = hrc_make_canvas(dim, dim, CF_PIXEL_FORMAT_R8G8B8A8_UNORM);
 
 	// Materials.
-	hrc.mat_seed = cf_make_material();
+	hrc.mat_trace = cf_make_material();
 	hrc.mat_extend = cf_make_material();
 	hrc.mat_merge = cf_make_material();
+	hrc.mat_sum_quadrants = cf_make_material();
+	hrc.mat_blur = cf_make_material();
 	hrc.mat_composite = cf_make_material();
-	hrc.mat_copy = cf_make_material();
 
-	// Compute shaders (loaded from hrc_data/ next to the executable).
-	hrc.cs_seed = load_compute_shader("/hrc_data/hrc_seed.c_shd");
+	// Compute shaders.
+	hrc.cs_trace = load_compute_shader("/hrc_data/hrc_trace.c_shd");
 	hrc.cs_extend = load_compute_shader("/hrc_data/hrc_extend.c_shd");
 	hrc.cs_merge = load_compute_shader("/hrc_data/hrc_merge.c_shd");
-	hrc.cs_copy = load_compute_shader("/hrc_data/hrc_copy.c_shd");
+	hrc.cs_sum_quadrants = load_compute_shader("/hrc_data/hrc_sum_quadrants.c_shd");
+	hrc.cs_blur = load_compute_shader("/hrc_data/hrc_blur.c_shd");
 	hrc.cs_composite = load_compute_shader("/hrc_data/hrc_composite.c_shd");
 }
 
 void hrc_shutdown()
 {
-	cf_destroy_canvas(hrc.emissivity);
-	cf_destroy_canvas(hrc.absorption);
+	cf_destroy_canvas(hrc.emission);
+	cf_destroy_canvas(hrc.transmittance);
 	for (int i = 0; i <= HRC_N; i++) {
-		cf_destroy_storage_buffer(hrc.vrays_rad[i]);
-		cf_destroy_storage_buffer(hrc.vrays_trn[i]);
+		cf_destroy_storage_buffer(hrc.t_rad[i]);
+		cf_destroy_storage_buffer(hrc.t_trn[i]);
 	}
 	for (int i = 0; i < 2; i++)
 		cf_destroy_storage_buffer(hrc.r_rad[i]);
 	cf_destroy_storage_buffer(hrc.r_zero);
 	for (int i = 0; i < 4; i++)
 		cf_destroy_storage_buffer(hrc.frustum[i]);
+	for (int i = 0; i < HRC_N; i++)
+		cf_destroy_storage_buffer(hrc.merge_weights[i]);
+	cf_destroy_texture(hrc.radiance_preblur);
+	cf_destroy_texture(hrc.radiance);
 	cf_destroy_canvas(hrc.fluence);
-	cf_destroy_material(hrc.mat_seed);
+	cf_destroy_material(hrc.mat_trace);
 	cf_destroy_material(hrc.mat_extend);
 	cf_destroy_material(hrc.mat_merge);
+	cf_destroy_material(hrc.mat_sum_quadrants);
+	cf_destroy_material(hrc.mat_blur);
 	cf_destroy_material(hrc.mat_composite);
-	cf_destroy_material(hrc.mat_copy);
-	cf_destroy_compute_shader(hrc.cs_seed);
+	cf_destroy_compute_shader(hrc.cs_trace);
 	cf_destroy_compute_shader(hrc.cs_extend);
 	cf_destroy_compute_shader(hrc.cs_merge);
-	cf_destroy_compute_shader(hrc.cs_copy);
+	cf_destroy_compute_shader(hrc.cs_sum_quadrants);
+	cf_destroy_compute_shader(hrc.cs_blur);
 	cf_destroy_compute_shader(hrc.cs_composite);
 }
 
@@ -176,112 +245,118 @@ void hrc_shutdown()
 
 void hrc_compute()
 {
-	CF_Texture emiss_tex = cf_canvas_get_target(hrc.emissivity);
-	CF_Texture absrp_tex = cf_canvas_get_target(hrc.absorption);
+	CF_Texture emiss_tex = cf_canvas_get_target(hrc.emission);
+	CF_Texture trans_tex = cf_canvas_get_target(hrc.transmittance);
 	CF_Texture fluence_tex = cf_canvas_get_target(hrc.fluence);
-
 	int dim = HRC_DIM;
 
 	for (int j = 0; j < 4; j++) {
-		// Seed T_0.
-		{
-			int params[2] = { j, dim };
-			cf_material_set_texture_cs(hrc.mat_seed, "u_emissivity", emiss_tex);
-			cf_material_set_texture_cs(hrc.mat_seed, "u_absorption", absrp_tex);
-			cf_material_set_uniform_cs(hrc.mat_seed, "u_rotate", params + 0, CF_UNIFORM_TYPE_INT, 1);
-			cf_material_set_uniform_cs(hrc.mat_seed, "u_world_size", params + 1, CF_UNIFORM_TYPE_INT, 1);
+		// Trace T_0..cutoff-1 via DDA.
+		int trace_max = HRC_TRACE_CUTOFF < HRC_N ? HRC_TRACE_CUTOFF : HRC_N;
+		for (int level = 0; level < trace_max; level++) {
+			int rot_w = dim; // square world, so rot_w == rot_h == dim for all rotations
+			int rot_h = dim;
+
+			cf_material_set_texture_cs(hrc.mat_trace, "u_emission", emiss_tex);
+			cf_material_set_texture_cs(hrc.mat_trace, "u_transmittance", trans_tex);
+
+			int params[6] = { level, j, rot_w, rot_h, dim, dim };
+			cf_material_set_uniform_cs(hrc.mat_trace, "u_cascade", params + 0, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_trace, "u_rotate", params + 1, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_trace, "u_world_w", params + 2, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_trace, "u_world_h", params + 3, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_trace, "u_work_w", params + 4, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_trace, "u_work_h", params + 5, CF_UNIFORM_TYPE_INT, 1);
+			float mip_level = 0.0f;
+			cf_material_set_uniform_cs(hrc.mat_trace, "u_mip_level", &mip_level, CF_UNIFORM_TYPE_FLOAT, 1);
 
 			CF_ComputeDispatch d = cf_compute_dispatch_defaults(
-				hrc_div_ceil(hrc.vrays_w[0], HRC_WG),
-				hrc_div_ceil(dim, HRC_WG),
+				hrc_div_ceil(hrc_t_width(rot_w, level), HRC_WG),
+				hrc_div_ceil(rot_h, HRC_WG),
 				1
 			);
-			CF_StorageBuffer rw[2] = { hrc.vrays_rad[0], hrc.vrays_trn[0] };
+			CF_StorageBuffer rw[2] = { hrc.t_rad[level], hrc.t_trn[level] };
 			d.rw_buffers = rw;
 			d.rw_buffer_count = 2;
-			cf_dispatch_compute(hrc.cs_seed, hrc.mat_seed, d);
+			cf_dispatch_compute(hrc.cs_trace, hrc.mat_trace, d);
 		}
 
-		// Extend T_1..T_N.
-		for (int i = 1; i <= HRC_N; i++) {
-			int params[4] = { i, dim, hrc.vrays_w[i - 1], hrc.vrays_w[i] };
+		// Extend T_cutoff..T_N.
+		for (int level = trace_max; level <= HRC_N; level++) {
+			int rot_w = dim;
+			int rot_h = dim;
+			int prev_w = hrc_t_width(rot_w, level - 1);
+			int curr_w = hrc_t_width(rot_w, level);
+
+			int params[5] = { level, rot_w, rot_h, prev_w, curr_w };
 			cf_material_set_uniform_cs(hrc.mat_extend, "u_cascade", params + 0, CF_UNIFORM_TYPE_INT, 1);
-			cf_material_set_uniform_cs(hrc.mat_extend, "u_world_size", params + 1, CF_UNIFORM_TYPE_INT, 1);
-			cf_material_set_uniform_cs(hrc.mat_extend, "u_prev_w", params + 2, CF_UNIFORM_TYPE_INT, 1);
-			cf_material_set_uniform_cs(hrc.mat_extend, "u_curr_w", params + 3, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_extend, "u_world_w", params + 1, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_extend, "u_world_h", params + 2, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_extend, "u_prev_w", params + 3, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_extend, "u_curr_w", params + 4, CF_UNIFORM_TYPE_INT, 1);
 
 			CF_ComputeDispatch d = cf_compute_dispatch_defaults(
-				hrc_div_ceil(hrc.vrays_w[i], HRC_WG),
-				hrc_div_ceil(dim, HRC_WG),
+				hrc_div_ceil(curr_w, HRC_WG),
+				hrc_div_ceil(rot_h, HRC_WG),
 				1
 			);
-			CF_StorageBuffer ro[2] = { hrc.vrays_rad[i - 1], hrc.vrays_trn[i - 1] };
+			CF_StorageBuffer ro[2] = { hrc.t_rad[level - 1], hrc.t_trn[level - 1] };
 			d.ro_buffers = ro;
 			d.ro_buffer_count = 2;
-			CF_StorageBuffer rw[2] = { hrc.vrays_rad[i], hrc.vrays_trn[i] };
+			CF_StorageBuffer rw[2] = { hrc.t_rad[level], hrc.t_trn[level] };
 			d.rw_buffers = rw;
 			d.rw_buffer_count = 2;
 			cf_dispatch_compute(hrc.cs_extend, hrc.mat_extend, d);
 		}
 
-		// Merge R_{N-1} down to R_0.
+		// Merge R_{N-1} down to R_0. Final merge writes directly to frustum[j].
+		int rot_w = dim;
+		int rot_h = dim;
 		int r_ping = 0;
 		for (int i = HRC_N - 1; i >= 0; i--) {
-			int params[6] = { i, dim, hrc.vrays_w[i], hrc.vrays_w[i + 1], dim, dim };
+			int t_curr_w = hrc_t_width(rot_w, i);
+			int t_next_w = hrc_t_width(rot_w, i + 1);
+			int r_prev_w = hrc_r_width(rot_w, i + 1);
+			int r_curr_w = hrc_r_width(rot_w, i);
+
+			int params[7] = { i, rot_w, rot_h, t_curr_w, t_next_w, r_prev_w, r_curr_w };
 			cf_material_set_uniform_cs(hrc.mat_merge, "u_cascade", params + 0, CF_UNIFORM_TYPE_INT, 1);
-			cf_material_set_uniform_cs(hrc.mat_merge, "u_world_size", params + 1, CF_UNIFORM_TYPE_INT, 1);
-			cf_material_set_uniform_cs(hrc.mat_merge, "u_t_curr_w", params + 2, CF_UNIFORM_TYPE_INT, 1);
-			cf_material_set_uniform_cs(hrc.mat_merge, "u_t_next_w", params + 3, CF_UNIFORM_TYPE_INT, 1);
-			cf_material_set_uniform_cs(hrc.mat_merge, "u_r_prev_w", params + 4, CF_UNIFORM_TYPE_INT, 1);
-			cf_material_set_uniform_cs(hrc.mat_merge, "u_r_curr_w", params + 5, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_merge, "u_world_w", params + 1, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_merge, "u_world_h", params + 2, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_merge, "u_t_curr_w", params + 3, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_merge, "u_t_next_w", params + 4, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_merge, "u_r_prev_w", params + 5, CF_UNIFORM_TYPE_INT, 1);
+			cf_material_set_uniform_cs(hrc.mat_merge, "u_r_curr_w", params + 6, CF_UNIFORM_TYPE_INT, 1);
+
+			CF_StorageBuffer r_prev = (i == HRC_N - 1) ? hrc.r_zero : hrc.r_rad[1 - r_ping];
+			CF_StorageBuffer r_out = (i == 0) ? hrc.frustum[j] : hrc.r_rad[r_ping];
 
 			CF_ComputeDispatch d = cf_compute_dispatch_defaults(
-				hrc_div_ceil(dim, HRC_WG),
-				hrc_div_ceil(dim, HRC_WG),
+				hrc_div_ceil(r_curr_w, HRC_WG),
+				hrc_div_ceil(rot_h, HRC_WG),
 				1
 			);
-			CF_StorageBuffer r_prev = (i == HRC_N - 1) ? hrc.r_zero : hrc.r_rad[1 - r_ping];
-			CF_StorageBuffer ro[5] = {
-				hrc.vrays_rad[i], hrc.vrays_trn[i],
-				hrc.vrays_rad[i + 1], hrc.vrays_trn[i + 1],
-				r_prev
+			CF_StorageBuffer ro[6] = {
+				hrc.t_rad[i], hrc.t_trn[i],
+				hrc.t_rad[i + 1], hrc.t_trn[i + 1],
+				r_prev,
+				hrc.merge_weights[i]
 			};
 			d.ro_buffers = ro;
-			d.ro_buffer_count = 5;
-			CF_StorageBuffer rw[1] = { hrc.r_rad[r_ping] };
+			d.ro_buffer_count = 6;
+			CF_StorageBuffer rw[1] = { r_out };
 			d.rw_buffers = rw;
 			d.rw_buffer_count = 1;
 			cf_dispatch_compute(hrc.cs_merge, hrc.mat_merge, d);
 			r_ping = 1 - r_ping;
 		}
-
-		// Copy R_0 -> frustum[j].
-		{
-			int count = dim * dim;
-			cf_material_set_uniform_cs(hrc.mat_copy, "u_count", &count, CF_UNIFORM_TYPE_INT, 1);
-
-			CF_ComputeDispatch d = cf_compute_dispatch_defaults(
-				hrc_div_ceil(count, 256),
-				1,
-				1
-			);
-			CF_StorageBuffer ro[1] = { hrc.r_rad[1 - r_ping] };
-			d.ro_buffers = ro;
-			d.ro_buffer_count = 1;
-			CF_StorageBuffer rw[1] = { hrc.frustum[j] };
-			d.rw_buffers = rw;
-			d.rw_buffer_count = 1;
-			cf_dispatch_compute(hrc.cs_copy, hrc.mat_copy, d);
-		}
 	}
 
-	// Composite: sum 4 quadrants, cross blur, output.
+	// Sum quadrants: frustum[0..3] -> radiance_preblur.
 	{
-		float abs_thresh = HRC_ABS_THRESHOLD;
-		int debug = hrc.debug_mode <= 5 ? hrc.debug_mode : 0;
-		cf_material_set_uniform_cs(hrc.mat_composite, "u_world_size", &dim, CF_UNIFORM_TYPE_INT, 1);
-		cf_material_set_uniform_cs(hrc.mat_composite, "u_abs_threshold", &abs_thresh, CF_UNIFORM_TYPE_FLOAT, 1);
-		cf_material_set_uniform_cs(hrc.mat_composite, "u_debug_mode", &debug, CF_UNIFORM_TYPE_INT, 1);
+		int params[2] = { dim, dim };
+		cf_material_set_uniform_cs(hrc.mat_sum_quadrants, "u_world_w", params + 0, CF_UNIFORM_TYPE_INT, 1);
+		cf_material_set_uniform_cs(hrc.mat_sum_quadrants, "u_world_h", params + 1, CF_UNIFORM_TYPE_INT, 1);
 
 		CF_ComputeDispatch d = cf_compute_dispatch_defaults(
 			hrc_div_ceil(dim, HRC_WG),
@@ -294,9 +369,54 @@ void hrc_compute()
 		};
 		d.ro_buffers = ro;
 		d.ro_buffer_count = 4;
-		CF_Texture ro_tex[1] = { absrp_tex };
+		CF_Texture rw_tex[1] = { hrc.radiance_preblur };
+		d.rw_textures = rw_tex;
+		d.rw_texture_count = 1;
+		cf_dispatch_compute(hrc.cs_sum_quadrants, hrc.mat_sum_quadrants, d);
+	}
+
+	// Blur: radiance_preblur -> radiance.
+	{
+		cf_material_set_texture_cs(hrc.mat_blur, "u_in_radiance", hrc.radiance_preblur);
+		cf_material_set_texture_cs(hrc.mat_blur, "u_transmittance", trans_tex);
+		float src_texel_size[2] = { 1.0f / (float)dim, 1.0f / (float)dim };
+		cf_material_set_uniform_cs(hrc.mat_blur, "u_src_texel_size", src_texel_size, CF_UNIFORM_TYPE_FLOAT2, 1);
+		float mip_level = 0.0f;
+		cf_material_set_uniform_cs(hrc.mat_blur, "u_mip_level", &mip_level, CF_UNIFORM_TYPE_FLOAT, 1);
+
+		CF_ComputeDispatch d = cf_compute_dispatch_defaults(
+			hrc_div_ceil(dim, HRC_BLUR_WG),
+			hrc_div_ceil(dim, HRC_BLUR_WG),
+			1
+		);
+		CF_Texture rw_tex[1] = { hrc.radiance };
+		d.rw_textures = rw_tex;
+		d.rw_texture_count = 1;
+		cf_dispatch_compute(hrc.cs_blur, hrc.mat_blur, d);
+	}
+
+	// Composite: radiance/preblur/frustums -> fluence (rgba8).
+	{
+		int debug = hrc.debug_mode <= 5 ? hrc.debug_mode : 0;
+		int params[3] = { dim, dim, debug };
+		cf_material_set_uniform_cs(hrc.mat_composite, "u_world_w", params + 0, CF_UNIFORM_TYPE_INT, 1);
+		cf_material_set_uniform_cs(hrc.mat_composite, "u_world_h", params + 1, CF_UNIFORM_TYPE_INT, 1);
+		cf_material_set_uniform_cs(hrc.mat_composite, "u_debug_mode", params + 2, CF_UNIFORM_TYPE_INT, 1);
+
+		CF_ComputeDispatch d = cf_compute_dispatch_defaults(
+			hrc_div_ceil(dim, HRC_WG),
+			hrc_div_ceil(dim, HRC_WG),
+			1
+		);
+		CF_Texture ro_tex[2] = { hrc.radiance, hrc.radiance_preblur };
 		d.ro_textures = ro_tex;
-		d.ro_texture_count = 1;
+		d.ro_texture_count = 2;
+		CF_StorageBuffer ro[4] = {
+			hrc.frustum[0], hrc.frustum[1],
+			hrc.frustum[2], hrc.frustum[3]
+		};
+		d.ro_buffers = ro;
+		d.ro_buffer_count = 4;
 		CF_Texture rw_tex[1] = { fluence_tex };
 		d.rw_textures = rw_tex;
 		d.rw_texture_count = 1;
@@ -321,10 +441,15 @@ OrbLight orbs[4];
 
 void scene_init()
 {
-	orbs[0] = (OrbLight){ 140.0f, 0.7f, 0.0f,        cf_make_color_rgb_f(1.0f, 0.2f, 0.1f) };
-	orbs[1] = (OrbLight){ 160.0f, -0.5f, CF_PI * 0.5f,   cf_make_color_rgb_f(0.1f, 1.0f, 0.2f) };
-	orbs[2] = (OrbLight){ 120.0f, 0.9f, CF_PI,            cf_make_color_rgb_f(0.2f, 0.3f, 1.0f) };
-	orbs[3] = (OrbLight){ 180.0f, -0.3f, CF_PI * 1.5f,    cf_make_color_rgb_f(1.0f, 0.9f, 0.1f) };
+	// Pre-linearize colors so the trace shader reads linear values directly.
+	orbs[0] = (OrbLight){ 140.0f, 0.7f, 0.0f,
+		cf_make_color_rgb_f(powf(1.0f, 2.2f), powf(0.2f, 2.2f), powf(0.1f, 2.2f)) };
+	orbs[1] = (OrbLight){ 160.0f, -0.5f, CF_PI * 0.5f,
+		cf_make_color_rgb_f(powf(0.1f, 2.2f), powf(1.0f, 2.2f), powf(0.2f, 2.2f)) };
+	orbs[2] = (OrbLight){ 120.0f, 0.9f, CF_PI,
+		cf_make_color_rgb_f(powf(0.2f, 2.2f), powf(0.3f, 2.2f), powf(1.0f, 2.2f)) };
+	orbs[3] = (OrbLight){ 180.0f, -0.3f, CF_PI * 1.5f,
+		cf_make_color_rgb_f(powf(1.0f, 2.2f), powf(0.9f, 2.2f), powf(0.1f, 2.2f)) };
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -343,7 +468,7 @@ void handle_input()
 void begin_canvas_draw()
 {
 	cf_draw_push();
-	float ws = (float)HRC_WORLD_SIZE;
+	float ws = (float)HRC_DIM;
 	float half = ws * 0.5f;
 	cf_draw_TSR_absolute(cf_v2(0, 0), cf_v2(1, 1), 0);
 	cf_draw_projection(cf_ortho_2d(0, 0, ws, ws));
@@ -360,7 +485,6 @@ void draw_circle_at(float x, float y, float r)
 	cf_draw_circle_fill2(cf_v2(x, y), r);
 }
 
-// Push a render state with the correct pixel format for f16 canvases.
 void push_f16_render_state()
 {
 	CF_RenderState rs = cf_render_state_defaults();
@@ -379,11 +503,10 @@ typedef struct Light
 Light frame_lights[MAX_LIGHTS];
 int frame_light_count;
 
-// Compute all light positions for this frame and store them.
 void update_lights()
 {
-	float half = (float)HRC_WORLD_SIZE * 0.5f;
-	float ws = (float)HRC_WORLD_SIZE;
+	float half = (float)HRC_DIM * 0.5f;
+	float ws = (float)HRC_DIM;
 	float dt = CF_DELTA_TIME;
 	time_acc += dt;
 	frame_light_count = 0;
@@ -396,14 +519,14 @@ void update_lights()
 		frame_lights[frame_light_count++] = (Light){ cx, cy, 15.0f, orbs[i].color };
 	}
 
-	// Corner accent lights.
+	// Corner accent lights (pre-linearized).
 	{
 		float margin = 60.0f;
 		CF_Color corners[4] = {
-			cf_make_color_rgb_f(0.0f, 0.4f, 0.4f),
-			cf_make_color_rgb_f(0.5f, 0.3f, 0.0f),
-			cf_make_color_rgb_f(0.4f, 0.1f, 0.3f),
-			cf_make_color_rgb_f(0.2f, 0.5f, 0.0f),
+			cf_make_color_rgb_f(powf(0.0f, 2.2f), powf(0.4f, 2.2f), powf(0.4f, 2.2f)),
+			cf_make_color_rgb_f(powf(0.5f, 2.2f), powf(0.3f, 2.2f), powf(0.0f, 2.2f)),
+			cf_make_color_rgb_f(powf(0.4f, 2.2f), powf(0.1f, 2.2f), powf(0.3f, 2.2f)),
+			cf_make_color_rgb_f(powf(0.2f, 2.2f), powf(0.5f, 2.2f), powf(0.0f, 2.2f)),
 		};
 		float lx[4] = { margin, ws - margin, margin, ws - margin };
 		float ly[4] = { margin, margin, ws - margin, ws - margin };
@@ -413,7 +536,7 @@ void update_lights()
 	}
 }
 
-// Draw all lights as colored circles (for emissivity canvas).
+// Draw all lights as colored circles (for emission canvas).
 void draw_lights_emissive()
 {
 	for (int i = 0; i < frame_light_count; i++) {
@@ -423,11 +546,11 @@ void draw_lights_emissive()
 	}
 }
 
-// Draw all lights as white circles (for absorption canvas).
-// Light sources are opaque emitters -- they must absorb to emit.
-void draw_lights_absorbing()
+// Draw all lights as black circles (for transmittance canvas).
+// Light sources must block to emit -- they need opacity in the transmittance canvas.
+void draw_lights_blocking()
 {
-	cf_draw_push_color(cf_make_color_rgb_f(1.0f, 1.0f, 1.0f));
+	cf_draw_push_color(cf_make_color_rgb_f(0.0f, 0.0f, 0.0f));
 	for (int i = 0; i < frame_light_count; i++) {
 		draw_circle_at(frame_lights[i].x, frame_lights[i].y, frame_lights[i].r);
 	}
@@ -435,9 +558,9 @@ void draw_lights_absorbing()
 }
 
 //--------------------------------------------------------------------------------------------------
-// Draw emissivity (lights).
+// Draw emission (lights on black canvas, linear colors).
 
-void draw_emissivity()
+void draw_emission()
 {
 	begin_canvas_draw();
 	push_f16_render_state();
@@ -445,21 +568,39 @@ void draw_emissivity()
 	draw_lights_emissive();
 
 	cf_draw_pop_render_state();
-	cf_render_to(hrc.emissivity, true);
+	cf_clear_color(0.0f, 0.0f, 0.0f, 0.0f);
+	cf_render_to(hrc.emission, true);
 	end_canvas_draw();
 }
 
 //--------------------------------------------------------------------------------------------------
-// Draw absorption (shadow casters + light sources).
+// Draw transmittance (white canvas, multiplicative blend, black = opaque).
+//
+// Transmittance model: clear to white (fully transparent), draw black shapes
+// with multiplicative blending. Black at alpha=1 -> result = 0 (fully opaque).
+// This is the inverse of the old absorption model (white shapes on black canvas).
 
-void draw_absorption()
+void draw_transmittance()
 {
 	begin_canvas_draw();
-	push_f16_render_state();
 
-	cf_draw_push_color(cf_make_color_rgb_f(1.0f, 1.0f, 1.0f));
+	// Multiplicative blend state: rgb_result = dst * src + dst * (1 - src_alpha)
+	// Drawing black (0,0,0) at alpha=1: result = dst*0 + dst*0 = 0 (opaque)
+	// Drawing nothing: result = white (transparent)
+	CF_RenderState rs = cf_render_state_defaults();
+	rs.blend.enabled = true;
+	rs.blend.pixel_format = CF_PIXEL_FORMAT_R16G16B16A16_FLOAT;
+	rs.blend.rgb_src_blend_factor = CF_BLENDFACTOR_DST_COLOR;
+	rs.blend.rgb_dst_blend_factor = CF_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+	rs.blend.rgb_op = CF_BLEND_OP_ADD;
+	rs.blend.alpha_src_blend_factor = CF_BLENDFACTOR_ONE;
+	rs.blend.alpha_dst_blend_factor = CF_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+	rs.blend.alpha_op = CF_BLEND_OP_ADD;
+	cf_draw_push_render_state(rs);
 
-	float ws = (float)HRC_WORLD_SIZE;
+	cf_draw_push_color(cf_make_color_rgb_f(0.0f, 0.0f, 0.0f));
+
+	float ws = (float)HRC_DIM;
 	float half = ws * 0.5f;
 
 	// 5 circular pillars in quincunx pattern.
@@ -486,11 +627,14 @@ void draw_absorption()
 
 	cf_draw_pop_color();
 
-	// Light sources must absorb to emit (radiative transfer: rad = emiss * (1 - T)).
-	draw_lights_absorbing();
+	// Light sources must block to emit.
+	draw_lights_blocking();
 
 	cf_draw_pop_render_state();
-	cf_render_to(hrc.absorption, true);
+
+	// Clear to white (fully transparent) before drawing.
+	cf_clear_color(1.0f, 1.0f, 1.0f, 1.0f);
+	cf_render_to(hrc.transmittance, true);
 	end_canvas_draw();
 }
 
@@ -500,10 +644,10 @@ void draw_absorption()
 void display_fluence()
 {
 	CF_Canvas display = hrc.fluence;
-	if (hrc.debug_mode == 6) display = hrc.emissivity;
-	else if (hrc.debug_mode == 7) display = hrc.absorption;
+	if (hrc.debug_mode == 6) display = hrc.emission;
+	else if (hrc.debug_mode == 7) display = hrc.transmittance;
 
-	float ws = (float)HRC_WORLD_SIZE;
+	float ws = (float)HRC_DIM;
 	cf_draw_canvas(display, cf_v2(0, 0), cf_v2(ws, ws));
 }
 
@@ -521,8 +665,8 @@ int main(int argc, char* argv[])
 		cf_app_update(NULL);
 		handle_input();
 		update_lights();
-		draw_emissivity();
-		draw_absorption();
+		draw_emission();
+		draw_transmittance();
 		hrc_compute();
 		display_fluence();
 		cf_app_draw_onto_screen(true);

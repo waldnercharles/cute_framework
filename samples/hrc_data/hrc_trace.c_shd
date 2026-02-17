@@ -1,0 +1,134 @@
+// DDA path-traces cascade levels 0..cutoff.
+//
+// For each thread, march along the ray from probe origin to target endpoint,
+// stepping once per pixel boundary along the longest axis and accumulating
+// radiance/transmittance front-to-back. Produces the same T buffer format as extend.
+//
+// DDA gives higher quality than single-pixel seeding: it traces through
+// multiple pixels along the ray, correctly accumulating emission and transmittance.
+// At cascade 0 each ray is only 1px long (same as seed), but at cascades 1..cutoff
+// the rays grow to 2..2^cutoff pixels and DDA quality matters.
+//
+// Pipeline:  [trace x cutoff] -> [extend x (N-cutoff)] -> merge -> sum_quadrants -> blur -> composite
+//            ^^^^^^^^^^^^^^^^^^
+//
+// Output buffer layout (same as extend):
+//   width  = ceil(world_w / 2^n) * (2^n + 1)
+//   height = world_h
+//   index  = y * width + probe_x * directions + k
+
+layout(set = 0, binding = 0) uniform sampler2D u_emission;
+layout(set = 0, binding = 1) uniform sampler2D u_transmittance;
+
+layout(std430, set = 1, binding = 0) writeonly buffer OutRad { uvec2 data[]; } u_out_rad;
+layout(std430, set = 1, binding = 1) writeonly buffer OutTrn { uvec2 data[]; } u_out_trn;
+
+layout(set = 2, binding = 0) uniform Params
+{
+	int u_cascade;
+	int u_rotate;
+	int u_world_w;
+	int u_world_h;
+	int u_work_w;
+	int u_work_h;
+	float u_mip_level;
+};
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+uvec2 f16_store(vec4 val)
+{
+	return uvec2(packHalf2x16(val.xy), packHalf2x16(val.zw));
+}
+
+// Rotate from cascade-local pixel space back to world pixel space.
+// The cascade operates in a rotated coordinate system where +x is the
+// primary ray direction. This undoes the rotation for scene texture lookups.
+//
+//   rot 0: identity (rays point right)
+//   rot 1: 90° CW   (rays point down)
+//   rot 2: 180°     (rays point left)
+//   rot 3: 270° CW  (rays point up)
+ivec2 rotate_pixel(ivec2 p, int rot, int w, int h)
+{
+	if (rot == 1)      return ivec2(w - 1 - p.y, p.x);
+	else if (rot == 2) return ivec2(w - 1 - p.x, h - 1 - p.y);
+	else if (rot == 3) return ivec2(p.y, h - 1 - p.x);
+	return p;
+}
+
+void main()
+{
+	int step = 1 << u_cascade;
+	int directions = step + 1;
+	int cascade_w = (u_world_w + step - 1) / step * directions;
+
+	ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+	if (gid.x >= cascade_w || gid.y >= u_world_h) return;
+
+	int probe_x = gid.x / directions;
+	int k = gid.x - probe_x * directions;
+
+	// Ray endpoints in rotated cascade space.
+	// v_n(k) = (2^n, 2k - 2^n), so the ray goes from probe origin to:
+	//   start = (probe_x * step, y)
+	//   end   = (probe_x * step + step, y + 2k - step)
+	vec2 ray_start = vec2(float(probe_x * step), float(gid.y));
+	float y_offset = float(2 * k - step);
+	vec2 ray_end = vec2(float(probe_x * step + step), float(gid.y) + y_offset);
+
+	vec3 total_rad = vec3(0.0);
+	vec3 total_trn = vec3(1.0);
+
+	// DDA: step once per pixel boundary along longest axis.
+	// Simple DDA (Digital Differential Analyzer) that walks the ray
+	// pixel-by-pixel, sampling emission and transmittance at each step.
+	vec2 segment = ray_end - ray_start;
+	float intrv = max(abs(segment.x), abs(segment.y));
+	if (intrv < 1.0) intrv = 1.0;
+	vec2 delta = segment / intrv;
+	float step_length = length(delta);
+
+	for (float ii = 0.0; ii < intrv; ii += 1.0) {
+		vec2 sample_pos = ray_start + delta * min(ii, intrv - 1.0);
+		ivec2 pixel = ivec2(floor(sample_pos));
+
+		// Rotate from cascade space to world space for texture lookup.
+		ivec2 wp = rotate_pixel(pixel, u_rotate, u_work_w, u_work_h);
+		bool inbounds = wp.x >= 0 && wp.x < u_work_w && wp.y >= 0 && wp.y < u_work_h;
+
+		vec3 emiss = vec3(0.0);
+		vec3 trans = vec3(1.0);
+		if (inbounds) {
+			vec2 uv = (vec2(wp) + vec2(0.5)) / vec2(float(u_work_w), float(u_work_h));
+			emiss = textureLod(u_emission, uv, u_mip_level).rgb;
+			trans = clamp(textureLod(u_transmittance, uv, u_mip_level).rgb, 0.0, 1.0);
+		}
+
+		// Volumetric transmittance: T = trans^(step_length * 2^mip).
+		// The transmittance texture stores per-pixel transmittance. For a ray
+		// that crosses `dda_step` worth of pixels, we exponentiate.
+		float dda_step = step_length * exp2(u_mip_level);
+		vec3 trans_step = pow(trans, vec3(dda_step));
+		vec3 opacity = vec3(1.0) - trans_step;
+
+		// Emission contribution: when the medium is opaque, scale by
+		// opacity (energy conservation). When nearly transparent, use
+		// a linear approximation to avoid division instability.
+		bool has_opacity = any(greaterThan(opacity, vec3(0.001)));
+		vec3 rad = has_opacity ? opacity * emiss : emiss * dda_step;
+		if (!inbounds) {
+			rad = vec3(0.0);
+			trans_step = vec3(1.0);
+		}
+
+		// Front-to-back compositing: accumulate radiance attenuated by
+		// the transmittance so far, then multiply through the step's transmittance.
+		total_rad += total_trn * rad;
+		total_trn *= trans_step;
+	}
+
+	int out_idx = gid.y * cascade_w + gid.x;
+	u_out_rad.data[out_idx] = f16_store(vec4(total_rad, 1.0));
+	u_out_trn.data[out_idx] = f16_store(vec4(total_trn, 1.0));
+}
