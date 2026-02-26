@@ -1679,6 +1679,14 @@ static CF_PipelineKey s_make_pipeline_key(CF_RenderState* state, CF_MeshInternal
 	return key;
 }
 
+struct CF_StorageBufferInternal
+{
+	SDL_GPUBuffer* buffer;
+	SDL_GPUTransferBuffer* transfer_buffer;
+	int size;
+	SDL_GPUBufferUsageFlags usage;
+};
+
 void cf_sdlgpu_apply_shader(CF_Shader shader_handle, CF_Material material_handle)
 {
 	CF_ASSERT(g_ctx.canvas);
@@ -1821,6 +1829,28 @@ void cf_sdlgpu_apply_shader(CF_Shader shader_handle, CF_Material material_handle
 	// Clear sampler override after use.
 	g_ctx.sampler_override = NULL;
 
+	// Bind VS storage buffers.
+	if (material->vs_storage_buffers.count() > 0) {
+		int count = material->vs_storage_buffers.count();
+		SDL_GPUBuffer** buffers = SDL_stack_alloc(SDL_GPUBuffer*, count);
+		for (int i = 0; i < count; ++i) {
+			CF_StorageBufferInternal* sb = (CF_StorageBufferInternal*)material->vs_storage_buffers[i].id;
+			buffers[i] = sb->buffer;
+		}
+		SDL_BindGPUVertexStorageBuffers(pass, 0, buffers, (Uint32)count);
+	}
+
+	// Bind FS storage buffers.
+	if (material->fs_storage_buffers.count() > 0) {
+		int count = material->fs_storage_buffers.count();
+		SDL_GPUBuffer** buffers = SDL_stack_alloc(SDL_GPUBuffer*, count);
+		for (int i = 0; i < count; ++i) {
+			CF_StorageBufferInternal* sb = (CF_StorageBufferInternal*)material->fs_storage_buffers[i].id;
+			buffers[i] = sb->buffer;
+		}
+		SDL_BindGPUFragmentStorageBuffers(pass, 0, buffers, (Uint32)count);
+	}
+
 	// Copy over uniform data.
 	s_copy_uniforms(cmd, &material->block_arena, shader, &material->vs, true);
 	s_copy_uniforms(cmd, &material->block_arena, shader, &material->fs, false);
@@ -1902,13 +1932,6 @@ struct CF_ComputeShaderInternal
 		}
 		return -1;
 	}
-};
-
-struct CF_StorageBufferInternal
-{
-	SDL_GPUBuffer* buffer;
-	SDL_GPUTransferBuffer* transfer_buffer;
-	int size;
 };
 
 CF_ComputeShader cf_sdlgpu_make_compute_shader_from_bytecode(CF_ShaderBytecode bytecode)
@@ -2022,6 +2045,7 @@ CF_StorageBuffer cf_sdlgpu_make_storage_buffer(CF_StorageBufferParams params)
 	if (params.compute_readable) usage |= SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ;
 	if (params.compute_writable) usage |= SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE;
 	if (params.graphics_readable) usage |= SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ;
+	sb->usage = usage;
 
 	SDL_GPUBufferCreateInfo buf_info = {};
 	buf_info.usage = usage;
@@ -2051,10 +2075,8 @@ void cf_sdlgpu_update_storage_buffer(CF_StorageBuffer buffer, const void* data, 
 		int new_size = size * 2;
 		sb->size = new_size;
 
-		// Infer usage flags from the old buffer -- just re-create with same flags.
-		// For simplicity, use READ since we're uploading.
 		SDL_GPUBufferCreateInfo buf_info = {};
-		buf_info.usage = SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ;
+		buf_info.usage = sb->usage;
 		buf_info.size = (Uint32)new_size;
 		sb->buffer = SDL_CreateGPUBuffer(g_ctx.device, &buf_info);
 

@@ -1030,6 +1030,28 @@ CF_API void CF_CALL cf_update_storage_buffer(CF_StorageBuffer buffer, const void
  */
 CF_API void CF_CALL cf_destroy_storage_buffer(CF_StorageBuffer buffer);
 
+/**
+ * @function cf_material_set_storage_buffer_vs
+ * @category graphics
+ * @brief    Binds a storage buffer for read access in a vertex shader.
+ * @param    material  The material.
+ * @param    buffer    The storage buffer (must have been created with `graphics_readable = true`).
+ * @param    slot      The binding slot index in the vertex shader.
+ * @related  CF_StorageBuffer CF_Material
+ */
+CF_API void CF_CALL cf_material_set_storage_buffer_vs(CF_Material material, CF_StorageBuffer buffer, int slot);
+
+/**
+ * @function cf_material_set_storage_buffer_fs
+ * @category graphics
+ * @brief    Binds a storage buffer for read access in a fragment shader.
+ * @param    material  The material.
+ * @param    buffer    The storage buffer (must have been created with `graphics_readable = true`).
+ * @param    slot      The binding slot index in the fragment shader.
+ * @related  CF_StorageBuffer CF_Material
+ */
+CF_API void CF_CALL cf_material_set_storage_buffer_fs(CF_Material material, CF_StorageBuffer buffer, int slot);
+
 //--------------------------------------------------------------------------------------------------
 // Compute Dispatch.
 
@@ -2338,6 +2360,8 @@ CF_INLINE CF_StorageBufferParams storage_buffer_defaults(int size) { return cf_s
 CF_INLINE CF_StorageBuffer make_storage_buffer(CF_StorageBufferParams params) { return cf_make_storage_buffer(params); }
 CF_INLINE void update_storage_buffer(CF_StorageBuffer buffer, const void* data, int size) { cf_update_storage_buffer(buffer, data, size); }
 CF_INLINE void destroy_storage_buffer(CF_StorageBuffer buffer) { cf_destroy_storage_buffer(buffer); }
+CF_INLINE void material_set_storage_buffer_vs(CF_Material material, CF_StorageBuffer buffer, int slot) { cf_material_set_storage_buffer_vs(material, buffer, slot); }
+CF_INLINE void material_set_storage_buffer_fs(CF_Material material, CF_StorageBuffer buffer, int slot) { cf_material_set_storage_buffer_fs(material, buffer, slot); }
 CF_INLINE CF_ComputeDispatch compute_dispatch_defaults(int gx, int gy, int gz) { return cf_compute_dispatch_defaults(gx, gy, gz); }
 CF_INLINE void dispatch_compute(CF_ComputeShader shader, CF_Material material, CF_ComputeDispatch dispatch) { cf_dispatch_compute(shader, material, dispatch); }
 

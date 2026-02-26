@@ -142,6 +142,12 @@ struct CF_MaterialState
 	Cute::Array<CF_MaterialTex> textures;
 };
 
+struct CF_MaterialStorageBuffer
+{
+	uint64_t id; // CF_StorageBuffer.id (CF_StorageBufferInternal*)
+	int slot;
+};
+
 struct CF_MaterialInternal
 {
 	bool dirty = false;
@@ -151,6 +157,8 @@ struct CF_MaterialInternal
 	CF_MaterialState cs;
 	CF_Arena uniform_arena;
 	CF_Arena block_arena;
+	Cute::Array<CF_MaterialStorageBuffer> vs_storage_buffers;
+	Cute::Array<CF_MaterialStorageBuffer> fs_storage_buffers;
 };
 
 //--------------------------------------------------------------------------------------------------

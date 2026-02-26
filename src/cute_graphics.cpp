@@ -479,6 +479,32 @@ void cf_material_clear_textures(CF_Material material_handle)
 	material->dirty = true;
 }
 
+static void s_material_set_storage_buffer(Cute::Array<CF_MaterialStorageBuffer>& arr, CF_StorageBuffer buffer, int slot)
+{
+	for (int i = 0; i < arr.count(); ++i) {
+		if (arr[i].slot == slot) {
+			arr[i].id = buffer.id;
+			return;
+		}
+	}
+	CF_MaterialStorageBuffer sb;
+	sb.id = buffer.id;
+	sb.slot = slot;
+	arr.add(sb);
+}
+
+void cf_material_set_storage_buffer_vs(CF_Material material_handle, CF_StorageBuffer buffer, int slot)
+{
+	CF_MaterialInternal* material = (CF_MaterialInternal*)material_handle.id;
+	s_material_set_storage_buffer(material->vs_storage_buffers, buffer, slot);
+}
+
+void cf_material_set_storage_buffer_fs(CF_Material material_handle, CF_StorageBuffer buffer, int slot)
+{
+	CF_MaterialInternal* material = (CF_MaterialInternal*)material_handle.id;
+	s_material_set_storage_buffer(material->fs_storage_buffers, buffer, slot);
+}
+
 static void s_material_set_uniform(CF_Arena* arena, CF_MaterialState* state, const char* block_name, const char* name, void* data, CF_UniformType type, int array_length)
 {
 	if (array_length <= 0) array_length = 1;

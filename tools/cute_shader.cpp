@@ -571,19 +571,23 @@ CF_ShaderCompilerResult cute_shader_compile(const char* source, CF_ShaderCompile
 			memcpy(uniform_members, uniform_members_vec.data(), sizeof(CF_ShaderUniformMemberInfo) * num_uniform_members);
 		}
 
-		// Gather up type information on shader inputs.
+		// Gather up type information on shader inputs (skip built-ins like gl_InstanceIndex).
 		if (stage == CUTE_SHADER_STAGE_VERTEX) {
-			spvReflectEnumerateInputVariables(&module, &num_inputs, nullptr);
-			SpvReflectInterfaceVariable** reflected_inputs = (SpvReflectInterfaceVariable**)malloc(num_inputs * sizeof(SpvReflectInterfaceVariable*));
-			spvReflectEnumerateInputVariables(&module, &num_inputs, reflected_inputs);
-			inputs = (CF_ShaderInputInfo*)malloc(sizeof(CF_ShaderInputInfo) * num_inputs);
-			for (uint32_t input_index = 0; input_index < num_inputs; ++input_index) {
+			uint32_t total_inputs = 0;
+			spvReflectEnumerateInputVariables(&module, &total_inputs, nullptr);
+			SpvReflectInterfaceVariable** reflected_inputs = (SpvReflectInterfaceVariable**)malloc(total_inputs * sizeof(SpvReflectInterfaceVariable*));
+			spvReflectEnumerateInputVariables(&module, &total_inputs, reflected_inputs);
+			inputs = (CF_ShaderInputInfo*)malloc(sizeof(CF_ShaderInputInfo) * total_inputs);
+			num_inputs = 0;
+			for (uint32_t input_index = 0; input_index < total_inputs; ++input_index) {
 				SpvReflectInterfaceVariable* reflected_input = reflected_inputs[input_index];
+				if (reflected_input->decoration_flags & SPV_REFLECT_DECORATION_BUILT_IN) continue;
 
-				CF_ShaderInputInfo* input = &inputs[input_index];
+				CF_ShaderInputInfo* input = &inputs[num_inputs];
 				input->name = strdup(reflected_input->name);
 				input->location = reflected_input->location;
 				input->format = cute_shader::s_wrap(reflected_input->format);
+				num_inputs++;
 			}
 			free(reflected_inputs);
 		}
