@@ -1,0 +1,29 @@
+@PACKAGE_INIT@
+
+set_and_check(CUTE_INCLUDE_DIR "${PACKAGE_PREFIX_DIR}/include")
+set_and_check(CUTE_LIB_DIR "${PACKAGE_PREFIX_DIR}/lib")
+
+if(NOT TARGET cute)
+    # Determine library type from what's installed
+    find_library(CUTE_LIBRARY
+        NAMES cute
+        PATHS "${CUTE_LIB_DIR}"
+        NO_DEFAULT_PATH
+    )
+
+    if(NOT CUTE_LIBRARY)
+        message(FATAL_ERROR "cute library not found in ${CUTE_LIB_DIR}")
+    endif()
+
+    # Detect shared vs static from file extension
+    if(CUTE_LIBRARY MATCHES "\\.(dylib|so)$" OR (CUTE_LIBRARY MATCHES "\\.dll$"))
+        add_library(cute SHARED IMPORTED GLOBAL)
+    else()
+        add_library(cute STATIC IMPORTED GLOBAL)
+    endif()
+
+    set_target_properties(cute PROPERTIES
+        IMPORTED_LOCATION "${CUTE_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${CUTE_INCLUDE_DIR}"
+    )
+endif()

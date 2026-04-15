@@ -286,7 +286,6 @@ FetchContent_Declare(
 	GIT_REPOSITORY https://github.com/icculus/physfs.git
 	GIT_TAG        9d18d36b5a5207b72f473f05e1b2834e347d8144
 	UPDATE_DISCONNECTED TRUE
-	EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(physfs)
 
@@ -390,12 +389,12 @@ if(NOT EMSCRIPTEN) # Emscripten provides it's own SDL3.
 	endif()
 	set(SDL_TEST_LIBRARY OFF CACHE BOOL "Do not build SDL tests")
 	set(SDL_EXAMPLES OFF CACHE BOOL "Do not build SDL examples")
+	set(SDL_INSTALL ON CACHE BOOL "Install SDL3 alongside cute" FORCE)
 	FetchContent_Declare(
 		SDL3
 		URL https://github.com/libsdl-org/SDL/releases/download/release-${SDL_REQUIRED_VERSION}/SDL3-${SDL_REQUIRED_VERSION}.zip
 		DOWNLOAD_EXTRACT_TIMESTAMP ON
 		UPDATE_DISCONNECTED TRUE
-		EXCLUDE_FROM_ALL
 	)
 	FetchContent_MakeAvailable(SDL3)
 	if(CF_FRAMEWORK_STATIC)
@@ -480,7 +479,6 @@ if(NOT EMSCRIPTEN)  # SPIRV-Cross is not needed for web.
 		GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
 		GIT_TAG 0a88b2d5c08708d45692b7096a0a84e7bfae366c
 		UPDATE_DISCONNECTED TRUE
-		EXCLUDE_FROM_ALL
 	)
 	FetchContent_MakeAvailable(SPIRV_CROSS)
 	set(CF_LINK_LIBS ${CF_LINK_LIBS} spirv-cross-c)
@@ -542,10 +540,24 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 endif()
 
 # Propogate public headers to other cmake scripts including this subdirectory.
-target_include_directories(cute PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-target_include_directories(cute PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libraries>)
-target_include_directories(cute PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libraries/imgui>)
+target_include_directories(cute PUBLIC
+	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+	$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_include_directories(cute PUBLIC
+	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libraries>
+	$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_include_directories(cute PUBLIC
+	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libraries/imgui>
+	$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/imgui>
+)
 target_include_directories(cute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+
+# Install headers
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(DIRECTORY libraries/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+	FILES_MATCHING PATTERN "*.h")
 
 # Install target
 install(TARGETS cute
@@ -554,4 +566,17 @@ install(TARGETS cute
 	LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 	ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 	FRAMEWORK DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+# Package config (manual IMPORTED target — avoids export set conflicts with
+# FetchContent deps like SDL3, PhysFS, spirv-cross-c)
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+	"${CMAKE_CURRENT_SOURCE_DIR}/cmake/CuteConfig.cmake.in"
+	"${CMAKE_CURRENT_BINARY_DIR}/CuteConfig.cmake"
+	INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cute
+)
+install(FILES
+	"${CMAKE_CURRENT_BINARY_DIR}/CuteConfig.cmake"
+	DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cute
 )
